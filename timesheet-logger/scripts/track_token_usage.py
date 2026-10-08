@@ -10,7 +10,9 @@ import os
 import sys
 import json
 import glob
-from datetime import datetime, date
+import argparse
+import uuid
+from datetime import datetime, date, timezone
 
 DEFAULT_JSON_PATH = "token-usage.json"
 
@@ -130,6 +132,7 @@ def parse_codex(items, file_path, single_run):
     turns = {}
     current_turn_id = None
     user_prompts = {}
+    pending_tools = {}
     session_id = os.path.splitext(os.path.basename(file_path))[0]
 
     for item in items:
@@ -143,6 +146,10 @@ def parse_codex(items, file_path, single_run):
 
         if t == "turn_context" and p.get("turn_id"):
             current_turn_id = p.get("turn_id")
+
+        if t == "response_item" and p.get("type") in ("custom_tool_call", "function_call"):
+            tid = p.get("turn_id", current_turn_id or "default")
+            pending_tools.setdefault(tid, []).append(p.get("input", ""))
 
         if t == "response_item" and p.get("role") == "user":
             content = p.get("content", [])
@@ -161,9 +168,7 @@ def parse_codex(items, file_path, single_run):
 
         if t == "token_usage_record":
             tid = p.get("turn_id", current_turn_id or "default")
-            if tid not in turns:
-                turns[tid] = []
-            turns[tid].append(p)
+            turns.setdefault(tid, []).append({"usage": p.get("usage", {}), "tools": pending_tools.pop(tid, [])})
 
     if not turns:
         return None
@@ -180,7 +185,16 @@ def parse_codex(items, file_path, single_run):
 
     total_input = sum(r.get("usage", {}).get("input_tokens", 0) for r in target_records)
     total_output = sum(r.get("usage", {}).get("output_tokens", 0) for r in target_records)
-    total_cache = sum(r.get("usage", {}).get("cached_input_tokens", 0) for r in target_records)
+    total_cache = sum(r.get("usage", {}).get("cached_input_tokens", 0) + r.get("usage", {}).get("cache_write_input_tokens", 0) for r in target_records)
+    step_usage = {}
+    for record in target_records:
+        step = classify_codex_step(record.get("tools", []))
+        bucket = step_usage.setdefault(step, {"input": 0, "output": 0, "cache": 0, "total": 0})
+        usage = record.get("usage", {})
+        bucket["input"] += usage.get("input_tokens", 0)
+        bucket["output"] += usage.get("output_tokens", 0)
+        bucket["cache"] += usage.get("cached_input_tokens", 0) + usage.get("cache_write_input_tokens", 0)
+        bucket["total"] += usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
     total_tokens = total_input + total_output
 
     return {
@@ -192,8 +206,20 @@ def parse_codex(items, file_path, single_run):
         "input_tokens": total_input,
         "output_tokens": total_output,
         "cache_tokens": total_cache,
-        "total_tokens": total_tokens
+        "total_tokens": total_tokens,
+        "step_usage": step_usage,
+        "step_attribution": "tool_call_adjacent"
     }
+
+def classify_codex_step(tool_inputs):
+    text = " ".join(value if isinstance(value, str) else json.dumps(value) for value in tool_inputs).lower()
+    if "collect_work.py" in text or "collect_github.py" in text or "collect_calendar.py" in text:
+        return "collect_sources"
+    if "track_token_usage.py" in text and "begin" in text:
+        return "start_measurement"
+    if "track_token_usage.py" in text and "finalize" in text:
+        return "finalize_measurement"
+    return "worklog_synthesis"
 
 def parse_antigravity(items, file_path, single_run):
     session_id = os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(file_path))))
@@ -213,6 +239,19 @@ def parse_antigravity(items, file_path, single_run):
     total_output = sum(it.get("output_tokens", 0) for it in target_items if isinstance(it.get("output_tokens"), int))
     total_cache = sum(it.get("cache_read_tokens", 0) for it in target_items if isinstance(it.get("cache_read_tokens"), int))
     total_tokens = total_input + total_output
+    step_usage = {}
+    for item in target_items:
+        inp = item.get("input_tokens", 0)
+        out = item.get("output_tokens", 0)
+        cache = item.get("cache_read_tokens", 0)
+        if not isinstance(inp, int) or not isinstance(out, int):
+            continue
+        step = classify_codex_step([json.dumps(item, ensure_ascii=False)])
+        bucket = step_usage.setdefault(step, {"input": 0, "output": 0, "cache": 0, "total": 0})
+        bucket["input"] += inp
+        bucket["output"] += out
+        bucket["cache"] += cache if isinstance(cache, int) else 0
+        bucket["total"] += inp + out
 
     return {
         "agent": "antigravity",
@@ -223,7 +262,9 @@ def parse_antigravity(items, file_path, single_run):
         "input_tokens": total_input,
         "output_tokens": total_output,
         "cache_tokens": total_cache,
-        "total_tokens": total_tokens
+        "total_tokens": total_tokens,
+        "step_usage": step_usage,
+        "step_attribution": "transcript_marker"
     }
 
 def parse_claude(items, file_path, single_run):
@@ -235,15 +276,23 @@ def parse_claude(items, file_path, single_run):
         last_user_idx = -1
         for i, it in enumerate(items):
             if it.get("type") == "user" or it.get("role") == "user":
-                last_user_idx = i
                 msg_content = it.get("message", {}).get("content", "") or it.get("content", "")
-                prompt = str(msg_content)[:120].strip()
+                if isinstance(msg_content, list):
+                    text_parts = [block.get("text", "") for block in msg_content if isinstance(block, dict) and block.get("type") == "text"]
+                    prompt_text = " ".join(text_parts).strip()
+                else:
+                    prompt_text = str(msg_content).strip()
+                # Claude transcripts also encode tool results as user messages; only a human text prompt starts a run.
+                if prompt_text:
+                    last_user_idx = i
+                    prompt = prompt_text[:120]
         if last_user_idx != -1:
             target_items = items[last_user_idx:]
 
     total_input = 0
     total_output = 0
     total_cache = 0
+    step_usage = {}
 
     for it in target_items:
         usage = it.get("usage") or it.get("message", {}).get("usage")
@@ -256,6 +305,18 @@ def parse_claude(items, file_path, single_run):
             total_input += inp
             total_output += out
             total_cache += (cache_r + cache_c)
+            content = it.get("message", {}).get("content", [])
+            tool_inputs = []
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_use":
+                        tool_inputs.append(json.dumps({"name": block.get("name"), "input": block.get("input", {})}, ensure_ascii=False))
+            step = classify_codex_step(tool_inputs)
+            bucket = step_usage.setdefault(step, {"input": 0, "output": 0, "cache": 0, "total": 0})
+            bucket["input"] += inp
+            bucket["output"] += out
+            bucket["cache"] += cache_r + cache_c
+            bucket["total"] += inp + out
 
     return {
         "agent": "claude",
@@ -266,7 +327,9 @@ def parse_claude(items, file_path, single_run):
         "input_tokens": total_input,
         "output_tokens": total_output,
         "cache_tokens": total_cache,
-        "total_tokens": total_input + total_output
+        "total_tokens": total_input + total_output,
+        "step_usage": step_usage,
+        "step_attribution": "tool_call_adjacent"
     }
 
 def update_json_records(json_path, new_record):
@@ -286,6 +349,9 @@ def update_json_records(json_path, new_record):
     # Check if record for same turn/session already exists; if so, update it
     match_index = -1
     for idx, r in enumerate(records):
+        if new_record.get("run_id") and r.get("run_id") == new_record["run_id"]:
+            match_index = idx
+            break
         if r.get("session_id") == new_record["session_id"] and r.get("turn_id") == new_record.get("turn_id") and r.get("scope") == new_record["scope"]:
             match_index = idx
             break
@@ -298,70 +364,147 @@ def update_json_records(json_path, new_record):
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(records, f, indent=2, ensure_ascii=False)
 
+def run_state_path(run_id):
+    return os.path.join(".timesheet-token-runs", f"{run_id}.json")
+
+def begin_run(run_id=None, prompt=""):
+    """Mark the beginning of a worklog request; usage is collected when finalized."""
+    run_id = run_id or str(uuid.uuid4())
+    started_at = datetime.now(timezone.utc)
+    state = {
+        "run_id": run_id,
+        "started_at": started_at.isoformat(),
+        "prompt": prompt[:240],
+        "transcripts_before": find_session_transcripts()
+    }
+    path = run_state_path(run_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as state_file:
+        json.dump(state, state_file, indent=2, ensure_ascii=False)
+    return state
+
+def finalize_run(run_id, output_path=DEFAULT_JSON_PATH, transcript_paths=None, ended_at=None):
+    """Aggregate the latest prompt-to-response turn from every active agent transcript."""
+    state_path = run_state_path(run_id)
+    with open(state_path, "r", encoding="utf-8") as state_file:
+        state = json.load(state_file)
+    started = datetime.fromisoformat(state["started_at"])
+    ended = ended_at or datetime.now(timezone.utc)
+    explicit_paths = list(transcript_paths or [])
+    candidates = explicit_paths or find_session_transcripts()
+    before = set(state.get("transcripts_before", []))
+    active_paths = []
+    for path in candidates:
+        if not os.path.isfile(path):
+            continue
+        # Explicit paths are authoritative. Otherwise include files created or updated during this run.
+        if explicit_paths or path not in before or datetime.fromtimestamp(os.path.getmtime(path), timezone.utc) >= started:
+            active_paths.append(path)
+
+    components = []
+    seen = set()
+    for path in active_paths:
+        stats = detect_and_parse_transcript(path, single_run=True)
+        if not stats:
+            continue
+        identity = (stats.get("agent"), stats.get("session_id"))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        components.append({
+            "agent": stats["agent"],
+            "session_id": stats["session_id"],
+            "turn_id": stats.get("turn_id"),
+            "input": stats["input_tokens"],
+            "output": stats["output_tokens"],
+            "cache": stats["cache_tokens"],
+            "total": stats["total_tokens"],
+            "steps": stats.get("step_usage", {}),
+            "step_attribution": stats.get("step_attribution", "unavailable"),
+            "transcript_path": os.path.abspath(path)
+        })
+
+    total_input = sum(item["input"] for item in components)
+    total_output = sum(item["output"] for item in components)
+    total_cache = sum(item["cache"] for item in components)
+    step_usage = {}
+    for component in components:
+        for step, metrics in component["steps"].items():
+            bucket = step_usage.setdefault(step, {"input": 0, "output": 0, "cache": 0, "total": 0})
+            for metric in bucket:
+                bucket[metric] += metrics.get(metric, 0)
+    highest_cost_step = max(step_usage, key=lambda step: step_usage[step]["total"]) if step_usage else None
+    agents = sorted(set(item["agent"] for item in components))
+    record = {
+        "date": ended.astimezone().strftime("%Y-%m-%d"),
+        "timestamp": ended.astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+        "scope": "worklog_run",
+        "run_id": run_id,
+        "started_at": state["started_at"],
+        "completed_at": ended.isoformat(),
+        "trigger_prompt": state.get("prompt", ""),
+        "agents": agents,
+        "sessions": components,
+        "step_usage": step_usage,
+        "highest_cost_step": highest_cost_step,
+        "tokens": {
+            "input": total_input,
+            "output": total_output,
+            "cache": total_cache,
+            "total": total_input + total_output
+        },
+        "status": "measured" if components else "transcript_unavailable"
+    }
+    update_json_records(output_path, record)
+    os.remove(state_path)
+    return record
+
 def main():
-    args = sys.argv[1:]
-    single_run = True
-    target_json = DEFAULT_JSON_PATH
-    specific_file = None
+    parser = argparse.ArgumentParser(description="Track token usage for an end-to-end worklog run.")
+    subparsers = parser.add_subparsers(dest="command")
+    begin = subparsers.add_parser("begin", help="Start a worklog token measurement")
+    begin.add_argument("--run-id")
+    begin.add_argument("--prompt", default="")
+    finalize = subparsers.add_parser("finalize", help="Aggregate active agent transcripts for a run")
+    finalize.add_argument("--run-id", required=True)
+    finalize.add_argument("--output", default=DEFAULT_JSON_PATH)
+    finalize.add_argument("--transcript", action="append", dest="transcripts", help="Explicit transcript path; repeat for agent sessions")
+    args, legacy = parser.parse_known_args()
 
-    for arg in args:
-        if arg == "--full-session":
-            single_run = False
-        elif arg == "--single-run":
-            single_run = True
-        elif arg.endswith(".json"):
-            target_json = arg
-        elif arg.endswith(".jsonl"):
-            specific_file = arg
+    if args.command == "begin":
+        state = begin_run(args.run_id, args.prompt)
+        print(json.dumps({"run_id": state["run_id"], "started_at": state["started_at"]}))
+        return
+    if args.command == "finalize":
+        record = finalize_run(args.run_id, args.output, args.transcripts)
+        print(json.dumps({"run_id": record["run_id"], "status": record["status"], "agents": record["agents"], "tokens": record["tokens"], "highest_cost_step": record["highest_cost_step"], "step_usage": record["step_usage"]}, ensure_ascii=False))
+        return
 
-    if specific_file:
-        files_to_check = [specific_file]
-    else:
-        files_to_check = find_session_transcripts()
-
+    # Backward compatible one-shot mode: --single-run/--full-session [output.json] [transcript.jsonl]
+    single_run = "--full-session" not in legacy
+    positional = [arg for arg in legacy if not arg.startswith("--")]
+    target_json = next((arg for arg in positional if arg.endswith(".json")), DEFAULT_JSON_PATH)
+    specific_file = next((arg for arg in positional if arg.endswith(".jsonl")), None)
+    files_to_check = [specific_file] if specific_file else find_session_transcripts()
     if not files_to_check:
         print("No transcript .jsonl files found in current workspace or standard directories.")
         return
-
-    # Sort files by modification time (most recent first)
-    files_to_check.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+    files_to_check.sort(key=lambda path: os.path.getmtime(path), reverse=True)
     latest_file = files_to_check[0]
-
     stats = detect_and_parse_transcript(latest_file, single_run=single_run)
     if not stats:
         print(f"Could not parse token metrics from {latest_file}")
         return
-
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    today_str = date.today().strftime("%Y-%m-%d")
-
+    now = datetime.now()
     record = {
-        "date": today_str,
-        "timestamp": now_str,
-        "scope": stats["scope"],
-        "agent": stats["agent"],
-        "session_id": stats["session_id"],
-        "turn_id": stats.get("turn_id"),
-        "trigger_prompt": stats["prompt"],
-        "tokens": {
-            "input": stats["input_tokens"],
-            "output": stats["output_tokens"],
-            "cache": stats["cache_tokens"],
-            "total": stats["total_tokens"]
-        },
+        "date": date.today().strftime("%Y-%m-%d"), "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "scope": stats["scope"], "agent": stats["agent"], "session_id": stats["session_id"],
+        "turn_id": stats.get("turn_id"), "trigger_prompt": stats["prompt"],
+        "tokens": {"input": stats["input_tokens"], "output": stats["output_tokens"], "cache": stats["cache_tokens"], "total": stats["total_tokens"]},
         "transcript_path": latest_file
     }
-
     update_json_records(target_json, record)
-
-    print(f"Logged [{stats['scope']}] token usage in [{target_json}]:")
-    print(f" - Agent:         {stats['agent']}")
-    print(f" - Prompt:        {stats['prompt'][:60]}...")
-    print(f" - Session ID:    {stats['session_id']}")
-    print(f" - Input Tokens:  {stats['input_tokens']:,}")
-    print(f" - Output Tokens: {stats['output_tokens']:,}")
-    print(f" - Cache Tokens:  {stats['cache_tokens']:,}")
-    print(f" - Total Tokens:  {stats['total_tokens']:,}")
+    print(f"Logged [{stats['scope']}] token usage in [{target_json}]: {stats['total_tokens']:,} tokens ({stats['agent']}).")
 
 if __name__ == "__main__":
     main()
