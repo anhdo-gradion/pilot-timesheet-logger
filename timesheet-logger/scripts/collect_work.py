@@ -1,184 +1,83 @@
 #!/usr/bin/env python3
 """
 [Script Step] collect_work.py
-Deterministic collection of Git commits, GitHub PRs/issues, and Google Calendar events.
-Output is ultra-compact JSON to minimize LLM token budget (<50 tokens).
+Deterministic collection of GitHub commits, pull requests, PR comments/reviews, and Google Calendar events.
+Output is compact JSON containing only worklog-relevant activity and calendar events.
 GitHub data collection is delegated to collect_github.py using GitHub Search API.
 """
 
 import os
 import sys
-import warnings
-warnings.filterwarnings("ignore")
 import json
 import shutil
 import subprocess
+import argparse
 from datetime import datetime, date
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
+from collect_calendar import collect_today_events, ensure_google_auth
+from collect_github import collect_today_github, GitHubClient, get_github_token
 
 def get_today_str():
     return date.today().strftime("%Y-%m-%d")
 
-def run_cmd(cmd, cwd=None):
-    try:
-        res = subprocess.run(
-            cmd,
-            cwd=cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False
-        )
-        return res.returncode, res.stdout.strip(), res.stderr.strip()
-    except Exception as e:
-        return 1, "", str(e)
-
-def collect_git_commits(repo_path=".", target_date=None):
-    date_str = target_date or get_today_str()
-    # Format: short_hash|time|message
-    fmt = "%h|%ad|%s"
-    cmd = [
-        "git", "log", "--all",
-        f"--since={date_str} 00:00:00",
-        f"--until={date_str} 23:59:59",
-        "--date=format:%H:%M",
-        f"--format={fmt}"
-    ]
-    code, out, _ = run_cmd(cmd, cwd=repo_path)
-    if code != 0 or not out:
-        return []
-
-    commits = []
-    repo_name = os.path.basename(os.path.abspath(repo_path))
-    for line in out.splitlines():
-        parts = line.split("|", 2)
-        if len(parts) >= 3:
-            short_h, c_time, msg = parts[0], parts[1], parts[2]
-            commits.append({
-                "hash": short_h,
-                "time": c_time,
-                "msg": msg,
-                "repo": repo_name
-            })
-    return commits
-
-def collect_github(target_date=None, username=None):
-    """
-    Collects GitHub PRs, issues, and remote commits using the split collect_github.py module
-    (applying GitHub Search API).
-    """
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    if script_dir not in sys.path:
-        sys.path.insert(0, script_dir)
-
-    try:
-        from collect_github import collect_today_github
-        res = collect_today_github(username=username, target_date=target_date)
-        if isinstance(res, dict) and res.get("available"):
-            return res
-    except Exception:
-        pass
-
-    # Alternative: check if collect_github.py exists in same directory and run as subprocess
-    gh_script = os.path.join(script_dir, "collect_github.py")
-    if os.path.exists(gh_script):
-        cmd = [sys.executable, gh_script]
-        if username:
-            cmd.append(username)
-        if target_date:
-            cmd.append(target_date)
-        code, out, _ = run_cmd(cmd)
-        if code == 0 and out:
-            try:
-                data = json.loads(out)
-                if data.get("available"):
-                    return data
-            except Exception:
-                pass
-
-    return {"available": False, "commits": [], "prs": [], "issues": []}
-
-def collect_calendar(target_date=None):
-    """Tries to extract Google Calendar events using collect_calendar.py."""
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    if script_dir not in sys.path:
-        sys.path.insert(0, script_dir)
-
-    try:
-        from collect_calendar import collect_today_events
-        res = collect_today_events(target_date=target_date)
-        if isinstance(res, dict) and res.get("available"):
-            return res.get("events", [])
-    except Exception:
-        pass
-
-    cal_script = os.path.join(script_dir, "collect_calendar.py")
-    if os.path.exists(cal_script):
-        cmd = [sys.executable, cal_script]
-        if target_date:
-            cmd.append(target_date)
-        code, out, _ = run_cmd(cmd)
-        if code == 0 and out:
-            try:
-                data = json.loads(out)
-                if data.get("available"):
-                    return data.get("events", [])
-            except Exception:
-                pass
-    return []
-
 def main():
-    repo_dirs = []
-    target_date = get_today_str()
-    username = None
+    parser = argparse.ArgumentParser(description="Collect work activity for one date.")
+    parser.add_argument("--date", default=get_today_str(), help="Target date YYYY-MM-DD (default: today)")
+    parser.add_argument("--username", help="GitHub username (default: authenticated account)")
+    parser.add_argument("--timezone-offset", type=float, default=7, help="Timezone UTC offset in hours (default: +7)")
+    parser.add_argument("--mode", choices=["search"], default="search", help="GitHub Search API mode")
+    parser.add_argument("--auth", action="store_true", help="Open Google/GitHub browser authentication when needed")
+    args = parser.parse_args()
+    try:
+        datetime.strptime(args.date, "%Y-%m-%d")
+    except ValueError:
+        parser.error("--date must use YYYY-MM-DD")
+    target_date = args.date
+    username = args.username
+    if args.auth:
+        ensure_authentication()
 
-    for arg in sys.argv[1:]:
-        if os.path.isdir(arg):
-            repo_dirs.append(arg)
-        elif len(arg) == 10 and arg.count("-") == 2:
-            try:
-                datetime.strptime(arg, "%Y-%m-%d")
-                target_date = arg
-            except ValueError:
-                pass
-        elif not arg.startswith("-"):
-            username = arg
+    gh_data = collect_today_github(username=username, target_date=target_date, mode=args.mode, tz_offset_hours=args.timezone_offset)
+    activities = gh_data.get("activities", [])
 
-    if not repo_dirs:
-        repo_dirs = ["."]
-
-    all_commits = []
-    for r in repo_dirs:
-        all_commits.extend(collect_git_commits(r, target_date=target_date))
-
-    # GitHub Search API collection via split module
-    gh_data = collect_github(target_date=target_date, username=username)
-    gh_commits = gh_data.get("commits", [])
-    prs = gh_data.get("prs", [])
-
-    # Merge remote commits from GitHub Search API (avoid duplicate hashes)
-    known_hashes = {c.get("hash") for c in all_commits if c.get("hash")}
-    for rc in gh_commits:
-        h = rc.get("hash")
-        if h and h not in known_hashes:
-            all_commits.append(rc)
-            known_hashes.add(h)
-
-    events = collect_calendar(target_date=target_date)
-    all_commits.sort(key=lambda c: c.get("time", ""))
-
-    first_time = all_commits[0]["time"] if all_commits else "09:00"
-    last_time = all_commits[-1]["time"] if all_commits else "17:30"
+    calendar_data = collect_today_events(target_date=target_date, tz_offset_hours=args.timezone_offset)
+    events = calendar_data.get("events", [])
 
     structured_summary = {
         "date": target_date,
-        "span": [first_time, last_time],
-        "commits": all_commits,
-        "prs": prs,
-        "events": events
+        "timezone": f"UTC{args.timezone_offset:+g}",
+        "activities": activities,
+        "events": events,
+        "sources_available": {"github": gh_data.get("available", False), "calendar": calendar_data.get("available", False)},
+        "source_errors": {"github": gh_data.get("error"), "calendar": calendar_data.get("error")}
     }
 
     # Print compact JSON without whitespace to conserve model input tokens
     print(json.dumps(structured_summary, separators=(",", ":")))
+
+
+def ensure_authentication():
+    """Authenticate Google and GitHub in their browser-based native OAuth flows."""
+    ensure_google_auth()
+
+    existing_token = get_github_token()
+    if existing_token:
+        profile = GitHubClient(token=existing_token).request("/user")
+        if isinstance(profile, dict) and profile.get("login"):
+            return
+    if not shutil.which("gh"):
+        raise RuntimeError("GitHub login is missing. Install GitHub CLI (gh), then rerun with --auth.")
+    print("GitHub login required. Complete the browser authentication opened by GitHub CLI.", file=sys.stderr)
+    result = subprocess.run(
+        ["gh", "auth", "login", "--web", "--hostname", "github.com", "--scopes", "repo,read:user,user:email"],
+        check=False
+    )
+    if result.returncode != 0 or not get_github_token():
+        raise RuntimeError("GitHub browser authentication did not complete successfully.")
 
 if __name__ == "__main__":
     main()
