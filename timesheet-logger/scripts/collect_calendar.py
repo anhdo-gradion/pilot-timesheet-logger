@@ -2,34 +2,35 @@
 """
 [Script Step] collect_calendar.py
 Deterministic Google Calendar event extractor using Google Calendar REST API v3 directly.
-Fetches scheduled meetings and time blocks via standard HTTPS REST endpoints (<50 tokens).
+Fetches and compacts scheduled workday events via Google Calendar REST API v3.
 """
 
 import os
-import sys
 import json
 import re
 import html
 import urllib.request
 import urllib.parse
-from datetime import datetime, date, time
+import urllib.error
+import argparse
+from datetime import datetime, date, time, timezone, timedelta
 
 def get_credentials_paths():
     """Returns candidate paths for credentials.json and token.json."""
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     root_dir = os.path.dirname(base_dir)
     cred_candidates = [
-        os.path.join(base_dir, "credentials.json"),
         os.path.join(root_dir, "credentials.json"),
+        os.path.join(base_dir, "credentials.json"),
         os.path.join(os.getcwd(), "credentials.json")
     ]
     token_candidates = [
-        os.path.join(base_dir, "token.json"),
         os.path.join(root_dir, "token.json"),
+        os.path.join(base_dir, "token.json"),
         os.path.join(os.getcwd(), "token.json")
     ]
-    
-    cred_path = next((p for p in cred_candidates if os.path.exists(p)), cred_candidates[0])
+
+    cred_path = next((p for p in cred_candidates if os.path.exists(p) and os.path.getsize(p) > 0), cred_candidates[0])
     token_path = next((p for p in token_candidates if os.path.exists(p) and os.path.getsize(p) > 0), token_candidates[0])
     return cred_path, token_path
 
@@ -99,7 +100,38 @@ def get_access_token_via_rest():
         return access_token, None
     return None, "No valid access token or refresh token available."
 
-def collect_today_events(target_date=None):
+def ensure_google_auth():
+    """Open Google's installed-app OAuth flow in a browser when no usable token exists."""
+    access_token, _ = get_access_token_via_rest()
+    if access_token:
+        request = urllib.request.Request(
+            "https://www.googleapis.com/calendar/v3/calendars/primary",
+            headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10):
+                return True
+        except urllib.error.HTTPError as exc:
+            if exc.code != 401:
+                raise RuntimeError(f"Google Calendar validation failed (HTTP {exc.code}).") from exc
+
+    cred_path, token_path = get_credentials_paths()
+    if not os.path.exists(cred_path):
+        raise RuntimeError(f"Google OAuth credentials file is required at {cred_path}.")
+    try:
+        from google_auth_oauthlib.flow import InstalledAppFlow
+    except ImportError as exc:
+        raise RuntimeError("Install google-auth-oauthlib to authenticate Google Calendar in a browser.") from exc
+
+    scopes = ["https://www.googleapis.com/auth/calendar.readonly"]
+    flow = InstalledAppFlow.from_client_secrets_file(cred_path, scopes)
+    credentials = flow.run_local_server(port=0, open_browser=True)
+    os.makedirs(os.path.dirname(token_path), exist_ok=True)
+    with open(token_path, "w", encoding="utf-8") as token_file:
+        token_file.write(credentials.to_json())
+    return True
+
+def collect_today_events(target_date=None, tz_offset_hours=7, calendar_id="primary", max_results=250):
     """
     Connects to Google Calendar REST API v3 directly and fetches all events for the target day.
     Returns a list of dicts: [{"title": ..., "start": "HH:MM", "end": "HH:MM", "desc": ...}].
@@ -122,17 +154,19 @@ def collect_today_events(target_date=None):
 
     try:
         # Local start of day and end of day in ISO 8601
-        dt_start = datetime.combine(target_date, time.min).astimezone()
-        dt_end = datetime.combine(target_date, time.max).astimezone()
+        local_tz = timezone(timedelta(hours=float(tz_offset_hours)))
+        dt_start = datetime.combine(target_date, time.min, tzinfo=local_tz)
+        dt_end = datetime.combine(target_date, time.max, tzinfo=local_tz)
 
         params = {
             "timeMin": dt_start.isoformat(),
             "timeMax": dt_end.isoformat(),
             "singleEvents": "true",
-            "orderBy": "startTime"
+            "orderBy": "startTime",
+            "maxResults": int(max_results)
         }
         # Direct REST API HTTP request to Google Calendar API v3
-        url = f"https://www.googleapis.com/calendar/v3/calendars/primary/events?{urllib.parse.urlencode(params)}"
+        url = f"https://www.googleapis.com/calendar/v3/calendars/{urllib.parse.quote(calendar_id, safe='@')}/events?{urllib.parse.urlencode(params)}"
         req = urllib.request.Request(url, headers={
             "Authorization": f"Bearer {access_token}",
             "Accept": "application/json"
@@ -157,12 +191,13 @@ def collect_today_events(target_date=None):
                 text = re.sub(r'<[^>]+>', ' ', raw_desc)
                 text = html.unescape(text)
                 text = ' '.join(text.split()).strip()
-                if len(text) > 200:
-                    text = text[:197] + "..."
+                if len(text) > 120:
+                    text = text[:117] + "..."
                 clean_desc = text
 
             start_raw = item.get('start', {}).get('dateTime') or item.get('start', {}).get('date', '')
             end_raw = item.get('end', {}).get('dateTime') or item.get('end', {}).get('date', '')
+            all_day = "dateTime" not in item.get("start", {})
 
             # Extract HH:MM
             start_time = "09:00"
@@ -181,7 +216,8 @@ def collect_today_events(target_date=None):
             event_entry = {
                 "title": summary,
                 "start": start_time,
-                "end": end_time
+                "end": end_time,
+                "all_day": all_day
             }
             if clean_desc:
                 event_entry["desc"] = clean_desc
@@ -201,8 +237,13 @@ def collect_today_events(target_date=None):
         }
 
 def main():
-    target_date = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else None
-    result = collect_today_events(target_date)
+    parser = argparse.ArgumentParser(description="Collect Google Calendar events for a date.")
+    parser.add_argument("--date", default=None, help="Target date YYYY-MM-DD (default: today)")
+    parser.add_argument("--timezone-offset", type=float, default=7, help="Timezone UTC offset in hours")
+    parser.add_argument("--calendar-id", default="primary")
+    parser.add_argument("--max-results", type=int, default=250)
+    args = parser.parse_args()
+    result = collect_today_events(args.date, args.timezone_offset, args.calendar_id, args.max_results)
     print(json.dumps(result, separators=(',', ':')))
 
 if __name__ == "__main__":
