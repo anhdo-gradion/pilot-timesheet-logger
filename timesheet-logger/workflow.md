@@ -1,56 +1,27 @@
-# Daily Worklog Workflow
+# Worklog
 
-Return a draft JSON array in chat. Do not save it or submit a timesheet API request.
+1. **Start token tracking and run the script to collect and build.** Do not inspect source code, README, credentials, or tokens.
 
-## Collect
+   ```bash
+   python3 timesheet-logger/scripts/track_token_usage.py begin --prompt "<user_prompt>"
+   python3 timesheet-logger/scripts/run_worklog.py --date YYYY-MM-DD --work-period <period> --draft-only
+   python3 timesheet-logger/scripts/track_token_usage.py finalize --run-id <run_id>
+   ```
 
-Start token measurement before collection and remember the returned ID:
+   Omit `--date` for today. Use `morning` for 09:00–12:00, `afternoon` for 13:00–18:00, and `full` only when the user asks for a full day or does not specify a period. A partial-day draft includes only PRs with commit, review, or comment activity inside that period; do not pull later activity into an earlier draft. Cap each PR at four hours total for that date. Leave excess time unassigned if no other evidenced task can take it.
 
-```bash
-python3 timesheet-logger/scripts/track_token_usage.py begin --prompt "Log work for YYYY-MM-DD"
-```
+   The collector makes outbound HTTPS requests to `api.github.com`, `www.googleapis.com`, and `oauth2.googleapis.com`. Allow network access for the draft command when the execution environment asks. If `gh auth status` succeeds but the collector reports a connection error, treat it as a network failure and retry after enabling access; do not ask the user to repeat GitHub login for that error. Token tracking finalizes immediately after drafting (measuring prompt-to-draft only).
 
-Collect the requested date (today if omitted), using UTC+7 / `Asia/Ho_Chi_Minh` by default:
+2. **Show the result.** Visualize `timesheet-entries.json` as a calendar.
 
-```bash
-python3 timesheet-logger/scripts/collect_work.py --date YYYY-MM-DD --timezone-offset 7 --mode search --auth
-```
+3. **Wait for explicit approval in chat.** Approval is only for uploading this exact draft.
 
-`--username` is optional and defaults to the authenticated GitHub account. Search API is the only GitHub activity source. The collector returns commits, PRs, PR comments/reviews, and Calendar events; commits include `related_prs` resolved by SHA. Standalone issue comments are excluded. `--auth` opens Google OAuth or GitHub CLI web login when needed. Never ask for pasted credentials. Report unavailable sources.
+4. **After approval, push it.**
 
-## Synthesize
+   ```bash
+   python3 timesheet-logger/scripts/push_worklog.py submit --input timesheet-entries.json --confirm
+   ```
 
-- Use one entry per PR; never combine PRs, even when related or adjacent in time. Attach commits only to their `related_prs`.
-- Describe the code change from the full commit message. Use PR title/body to clarify; mention review or merge only when evidenced. Do not replace commit content with generic “review/merge” wording. Include that PR's number and URL.
-- Keep each Calendar event at its actual time. Fill 09:00–12:00 and 13:00–18:00 continuously with evidenced PR tasks and meetings; no overlaps or lunch entry. Split work intervals between PRs when boundaries are unclear, keeping each PR separate. Commit timestamps order activities but are not durations; open-to-done time is not work time. Do not invent task topics.
-- Exclude standalone issues and issue-only comments. Keep descriptions concise and verifiable.
+Never upload before approval. Do not check or read user source code during this flow.
 
-## Output
-
-Every work item must have exactly this shape:
-
-```json
-{
-  "arguments": {
-    "date": "2026-10-07",
-    "startTime": "15:30",
-    "endTime": "17:30",
-    "classification": "Gradion Intern Academy 2026",
-    "description": "Implement calendar event grouping for PR #12: https://github.com/org/repo/pull/12",
-    "task": "#SE",
-    "billable": false
-  }
-}
-```
-
-Keep the collector output compact (target under 800 tokens on a normal day). Do not include diffs or raw payloads in the draft.
-
-## Finalize tokens
-
-After preparing the JSON, run:
-
-```bash
-python3 timesheet-logger/scripts/track_token_usage.py finalize --run-id <run_id>
-```
-
-Pass `--transcript <path>` when automatic discovery misses an agent transcript; repeat for multiple sessions and include the run ID in helper-agent prompts. The tracker counts native per-response usage once, never cumulative totals or text-based estimates. It always writes a run record; missing state/transcript/usage is `status: "unavailable"`, `tokens: null`, with a reason. Report measured/unavailable status and `highest_cost_step` only when measured.
+If GitHub login fails because `gh` is missing, install GitHub CLI once (`brew install gh` on macOS) and rerun. The script then opens browser login automatically. Never ask for a GitHub token in chat.
