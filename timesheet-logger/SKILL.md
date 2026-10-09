@@ -1,8 +1,8 @@
 ---
 name: timesheet-logger
-description: Draft daily internship worklogs from Google Calendar and GitHub commits, PRs, comments, and reviews; report native token usage.
+description: Draft daily worklogs from GitHub and Google Calendar, visualize them for approval, then upload only after approval.
 ---
 
 # Timesheet Logger
 
-Use when asked to log work for today or a specific date. Follow [workflow.md](workflow.md) for collection, authentication, PR grouping, time allocation, output schema, and token measurement. Return JSON in chat; do not save or submit it unless asked. Never ask the user to paste credentials.
+Run `run_worklog.py --draft-only` with `--work-period morning` for morning requests, `afternoon` for afternoon requests, and `full` only for full-day or unspecified requests. Partial-day drafts include only GitHub activity within that period. Limit each PR/task to four hours per date; leave excess time unassigned unless another evidenced task can take it. Allow outbound network for GitHub and Google API collection when prompted. A successful `gh auth status` with collector connection errors indicates a network issue; do not prompt for another login. Visualize the entries, then wait for approval before pushing. Do not inspect user source code or upload before approval. See [workflow.md](workflow.md).
