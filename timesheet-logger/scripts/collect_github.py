@@ -74,16 +74,18 @@ class GitHubClient:
 
         except urllib.error.HTTPError as e:
             try:
-                error_body = e.read().decode("utf-8")
+                error_body = e.read().decode("utf-8", errors="replace")
                 error_data = json.loads(error_body)
-            except Exception:
+            except json.JSONDecodeError:
                 error_data = {}
             if e.code == 404:
                 return [] if "/events" in endpoint else {}
             return {"error": error_data.get("message", f"GitHub API returned HTTP {e.code}")}
 
-        except Exception as e:
-            return {}
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            raise RuntimeError(f"GitHub API request failed for {endpoint}: {e}") from None
+        except json.JSONDecodeError:
+            raise RuntimeError(f"GitHub API returned invalid JSON for {endpoint}.") from None
 
 def get_github_username(client: Optional[GitHubClient] = None) -> Optional[str]:
     """Auto-detects the authenticated GitHub username."""
@@ -315,12 +317,27 @@ def crawl_user_activity_via_search(client: GitHubClient, username: str, target_d
         "commits": []
     }
     seen_prs = set()
+    collection_errors = []
+
+    def search_all(endpoint, query, per_page=100):
+        items = []
+        for page in range(1, 11):
+            response = client.request(endpoint, {"q": query, "per_page": per_page, "page": page})
+            if not isinstance(response, dict) or response.get("error"):
+                raise RuntimeError(response.get("error", "GitHub Search API returned an invalid response."))
+            page_items = response.get("items", [])
+            items.extend(page_items)
+            total = int(response.get("total_count", len(items)))
+            if len(items) >= total or len(page_items) < per_page:
+                break
+        if len(items) < int(response.get("total_count", len(items))):
+            raise RuntimeError(f"GitHub Search API result exceeds the retrievable 1,000-item limit for: {query}")
+        return items
 
     # 1. Search PRs created
     try:
         q_prs = f"author:{username} type:pr created:{date_str}"
-        res_prs = client.request("/search/issues", {"q": q_prs, "per_page": 100})
-        for item in res_prs.get("items", []):
+        for item in search_all("/search/issues", q_prs):
             num = item.get("number")
             repo = item.get("repository_url", "").replace("https://api.github.com/repos/", "")
             seen_prs.add((repo, num))
@@ -336,14 +353,13 @@ def crawl_user_activity_via_search(client: GitHubClient, username: str, target_d
                 "created_at": item.get("created_at"),
                 "time": format_time_hh_mm(item.get("created_at"), tz_offset_hours)
             })
-    except Exception:
-        pass
+    except Exception as exc:
+        collection_errors.append(f"prs_created: {exc}")
 
     # 2. Search PRs updated
     try:
         q_prs_up = f"author:{username} type:pr updated:{date_str}"
-        res_prs_up = client.request("/search/issues", {"q": q_prs_up, "per_page": 100})
-        for item in res_prs_up.get("items", []):
+        for item in search_all("/search/issues", q_prs_up):
             num = item.get("number")
             repo = item.get("repository_url", "").replace("https://api.github.com/repos/", "")
             if (repo, num) not in seen_prs:
@@ -361,14 +377,13 @@ def crawl_user_activity_via_search(client: GitHubClient, username: str, target_d
                     "created_at": item.get("updated_at"),
                     "time": format_time_hh_mm(item.get("updated_at"), tz_offset_hours)
                 })
-    except Exception:
-        pass
+    except Exception as exc:
+        collection_errors.append(f"prs_updated: {exc}")
 
     # Search PRs reviewed
     try:
         q_review = f"reviewed-by:{username} type:pr updated:{date_str}"
-        res_reviews = client.request("/search/issues", {"q": q_review, "per_page": 50})
-        for item in res_reviews.get("items", []):
+        for item in search_all("/search/issues", q_review, per_page=50):
             repo = item.get("repository_url", "").replace("https://api.github.com/repos/", "")
             categorized["prs_reviewed"].append({
                 "number": item.get("number"),
@@ -380,14 +395,13 @@ def crawl_user_activity_via_search(client: GitHubClient, username: str, target_d
                 "created_at": item.get("updated_at"),
                 "time": format_time_hh_mm(item.get("updated_at"), tz_offset_hours)
             })
-    except Exception:
-        pass
+    except Exception as exc:
+        collection_errors.append(f"prs_reviewed: {exc}")
 
     # Search comments on PRs only; standalone issue comments are not worklog tasks.
     try:
         q_comment = f"commenter:{username} updated:{date_str}"
-        res_comments = client.request("/search/issues", {"q": q_comment, "per_page": 50})
-        for item in res_comments.get("items", []):
+        for item in search_all("/search/issues", q_comment, per_page=50):
             is_pr = "pull_request" in item
             repo = item.get("repository_url", "").replace("https://api.github.com/repos/", "")
             if is_pr:
@@ -401,17 +415,16 @@ def crawl_user_activity_via_search(client: GitHubClient, username: str, target_d
                     "created_at": item.get("updated_at"),
                     "time": format_time_hh_mm(item.get("updated_at"), tz_offset_hours)
                 })
-    except Exception:
-        pass
+    except Exception as exc:
+        collection_errors.append(f"pr_comments: {exc}")
 
     # 6. Search Commits
     try:
         q_commits = f"author:{username} author-date:{date_str}"
-        res_commits = client.request("/search/commits", {"q": q_commits, "per_page": 100})
-        for item in res_commits.get("items", []):
+        for item in search_all("/search/commits", q_commits):
             commit_data = item.get("commit", {})
             repo_info = item.get("repository", {})
-            repo_full_name = repo_info.get("name") or repo_info.get("full_name") or item.get("url", "").split("/commits/")[0].replace("https://api.github.com/repos/", "")
+            repo_full_name = repo_info.get("full_name") or repo_info.get("name") or item.get("url", "").split("/commits/")[0].replace("https://api.github.com/repos/", "")
             author_date = commit_data.get("author", {}).get("date")
             time_hh_mm = format_time_hh_mm(author_date, tz_offset_hours)
             msg = commit_data.get("message", "").strip()
@@ -425,8 +438,8 @@ def crawl_user_activity_via_search(client: GitHubClient, username: str, target_d
                 "created_at": author_date,
                 "time": time_hh_mm
             })
-    except Exception:
-        pass
+    except Exception as exc:
+        collection_errors.append(f"commits: {exc}")
 
     total_items = (
         len(categorized["prs_created"]) +
@@ -441,7 +454,8 @@ def crawl_user_activity_via_search(client: GitHubClient, username: str, target_d
         "username": username,
         "date": date_str,
         "total_results": total_items,
-        "categorized": categorized
+        "categorized": categorized,
+        "collection_errors": collection_errors,
     }
 
 # -------------------------------------------------------------
@@ -467,14 +481,69 @@ def collect_today_github(username=None, target_date=None, token=None, mode="sear
     username = username or get_github_username(client)
     day = parse_target_date(target_date)
     if not username:
-        return {"available": False, "error": "GitHub username unavailable.", "activities": []}
+        return {
+            "available": False,
+            "error": "GitHub username unavailable.",
+            "tasks": [],
+            "task_count": {"pull_requests": 0, "total": 0},
+        }
 
     result = crawl_user_activity(client, username, day, mode=mode, tz_offset_hours=tz_offset_hours)
+    if result.get("collection_errors"):
+        return {
+            "available": False,
+            "error": "; ".join(result["collection_errors"]),
+            "date": day.isoformat(),
+            "tasks": [],
+            "task_count": {"pull_requests": 0, "total": 0},
+        }
     categories = result.get("categorized", {})
-    activities = []
-    seen = set()
+    tasks = {}
+
+    def ensure_task(kind, repo, item):
+        number = item.get("number") or item.get("pr_number")
+        if not number:
+            return None
+        key = (kind, repo, str(number))
+        task = tasks.setdefault(key, {
+            "kind": kind,
+            "repo": repo,
+            "number": number,
+            "title": (item.get("title") or item.get("pr_title") or "").strip()[:160],
+            "url": item.get("url") or f"https://github.com/{repo}/{'pull' if kind == 'PR' else 'issues'}/{number}",
+            "time": item.get("time", "12:00"),
+            "commits": [],
+            "activity": [],
+            "has_direct_work": False,
+        })
+        if not task["title"]:
+            task["title"] = (item.get("title") or item.get("pr_title") or "").strip()[:160]
+        if item.get("body") and not task.get("body"):
+            task["body"] = item["body"][:240]
+        task["time"] = min(task["time"], item.get("time", task["time"]))
+        return task
+
+    pr_categories = {
+        "prs_created": "opened", "prs_updated": "updated", "prs_reviewed": "reviewed",
+        "pr_comments": "commented", "pr_reviews": "reviewed", "pr_review_comments": "reviewed",
+    }
+    for category, action in pr_categories.items():
+        for item in categories.get(category, []):
+            repo = item.get("repo", "")
+            task = ensure_task("PR", repo, item)
+            if task:
+                if action in {"opened", "updated"}:
+                    task["has_direct_work"] = True
+                if action in {"reviewed", "commented"}:
+                    continue
+                task["activity"].append({
+                    "kind": action,
+                    "time": item.get("time", "12:00"),
+                    "detail": (item.get("comment_body") or item.get("state") or "")[:160],
+                })
 
     associated_pr_cache = {}
+    unlinked_commits = []
     for commit in categories.get("commits", []):
         repo = commit.get("repo", "")
         sha = commit.get("sha", "")
@@ -490,58 +559,107 @@ def collect_today_github(username=None, target_date=None, token=None, mode="sear
                             "number": pr.get("number"),
                             "title": pr.get("title", ""),
                             "url": pr.get("html_url", f"https://github.com/{repo}/pull/{pr.get('number')}"),
+                            "body": (pr.get("body") or "").strip()[:240],
                         }
                         for pr in linked
                         if isinstance(pr, dict) and pr.get("number")
                     ]
             related_prs = associated_pr_cache[cache_key]
         message = (commit.get("message") or "").strip()
-        activity = {
-            "kind": "commit", "repo": repo, "sha": sha[:7],
-            "time": commit.get("time", "12:00"),
-            # Preserve commit subject and useful body context for a concrete work summary.
-            "title": message[:320], "url": commit.get("url", ""),
+        commit_entry = {
+            "sha": sha[:7], "time": commit.get("time", "12:00"),
+            "message": message[:320], "url": commit.get("url", ""),
         }
         if related_prs:
-            activity["related_prs"] = related_prs
-        activities.append(activity)
+            for pr in related_prs:
+                task = ensure_task("PR", repo, pr)
+                if task:
+                    task["has_direct_work"] = True
+                    if all(existing["sha"] != commit_entry["sha"] for existing in task["commits"]):
+                        task["commits"].append(commit_entry)
+        else:
+            unlinked_commits.append({"repo": repo, **commit_entry})
 
-    groups = {
-        "pull_requests": "pull_request", "prs_created": "pull_request", "prs_updated": "pull_request",
-        "pr_comments": "review",
-        "pr_reviews": "review", "pr_review_comments": "review", "prs_reviewed": "review"
+    activity_errors = []
+
+    def list_all(endpoint):
+        rows = []
+        for page in range(1, 11):
+            response = client.request(endpoint, {"per_page": 100, "page": page})
+            if not isinstance(response, list):
+                raise RuntimeError(response.get("error", f"GitHub returned invalid data for {endpoint}"))
+            rows.extend(response)
+            if len(response) < 100:
+                break
+        return rows
+
+    local_tz = timezone(timedelta(hours=tz_offset_hours))
+    for task in tasks.values():
+        if task["kind"] != "PR" or not task["repo"]:
+            continue
+        base = f"/repos/{task['repo']}/pulls/{task['number']}"
+        for endpoint, activity_kind, timestamp_field in (
+            (f"{base}/reviews", "code_review", "submitted_at"),
+            (f"{base}/comments", "code_review_comment", "created_at"),
+            (f"/repos/{task['repo']}/issues/{task['number']}/comments", "pr_comment", "created_at"),
+        ):
+            try:
+                records = list_all(endpoint)
+            except Exception as exc:
+                activity_errors.append(f"PR #{task['number']} {activity_kind}: {exc}")
+                continue
+            for record in records:
+                actor = record.get("user", {}).get("login", "")
+                timestamp = record.get(timestamp_field)
+                if actor.casefold() != username.casefold() or not timestamp:
+                    continue
+                if parse_iso_datetime(timestamp).astimezone(local_tz).date() != day:
+                    continue
+                detail = (record.get("body") or record.get("state") or "").strip().replace("\n", " ")[:180]
+                task["activity"].append({
+                    "kind": activity_kind,
+                    "time": format_time_hh_mm(timestamp, tz_offset_hours),
+                    "detail": detail,
+                })
+                activity_time = format_time_hh_mm(timestamp, tz_offset_hours)
+                task["time"] = min(task["time"], activity_time) if task["has_direct_work"] else min(
+                    (item["time"] for item in task["activity"] if item["kind"] in {"code_review", "code_review_comment", "pr_comment"}),
+                    default=activity_time,
+                )
+
+    if activity_errors:
+        return {
+            "available": False,
+            "error": "; ".join(activity_errors),
+            "date": day.isoformat(),
+            "tasks": [],
+            "task_count": {"pull_requests": 0, "total": 0},
+        }
+
+    tasks = {
+        key: task for key, task in tasks.items()
+        if task["has_direct_work"] or any(
+            item["kind"] in {"code_review", "code_review_comment", "pr_comment"}
+            for item in task["activity"]
+        )
     }
-    for category, kind in groups.items():
-        for item in categories.get(category, []):
-            number = item.get("number") or item.get("pr_number")
-            if not number:
-                continue
-            repo = item.get("repo", "")
-            is_pr = kind == "pull_request" or item.get("type") == "pull_request" or bool(item.get("pr_number"))
-            if not is_pr:
-                continue
-            target = "pull"
-            url = item.get("url") or (f"https://github.com/{repo}/{target}/{number}" if repo else "")
-            action = item.get("action") or item.get("state") or "activity"
-            title = item.get("title") or item.get("pr_title") or ""
-            summary = (item.get("comment_body") or "")[:100]
-            activity = {
-                "kind": kind if kind == "review" else "pull_request",
-                "action": action, "repo": repo, "number": number, "title": title[:120],
-                "url": url, "time": item.get("time", "12:00")
-            }
-            body = (item.get("body") or "").strip()
-            if body:
-                activity["body"] = body[:240]
-            if summary:
-                activity["summary"] = summary
-            identity = (activity["kind"], repo, number, activity["time"], action, title)
-            if identity not in seen:
-                activities.append(activity)
-                seen.add(identity)
+    for task in tasks.values():
+        task.pop("has_direct_work", None)
 
-    activities.sort(key=lambda item: item.get("time", ""))
-    return {"available": True, "activities": activities}
+    ordered_tasks = sorted(tasks.values(), key=lambda item: (item["time"], item["repo"], item["number"]))
+    for task in ordered_tasks:
+        task["commits"].sort(key=lambda item: item["time"])
+        task["activity"].sort(key=lambda item: item["time"])
+    return {
+        "available": True,
+        "date": day.isoformat(),
+        "tasks": ordered_tasks,
+        "task_count": {
+            "pull_requests": sum(task["kind"] == "PR" for task in ordered_tasks),
+            "total": len(ordered_tasks),
+        },
+        "unlinked_commits": unlinked_commits,
+    }
 
 def main():
     parser = argparse.ArgumentParser(description="Collect compact GitHub activity for worklog drafting.")
@@ -549,8 +667,31 @@ def main():
     parser.add_argument("--date")
     parser.add_argument("--mode", choices=["search"], default="search", help="GitHub Search API mode")
     parser.add_argument("--timezone-offset", type=float, default=7)
+    parser.add_argument("--auth", action="store_true", help="Open GitHub CLI browser login when needed")
     args = parser.parse_args()
+    if args.auth:
+        ensure_github_auth()
     print(json.dumps(collect_today_github(args.username, args.date, None, args.mode, args.timezone_offset), separators=(",", ":"), ensure_ascii=False))
+
+
+def ensure_github_auth():
+    token = get_github_token()
+    if token:
+        profile = GitHubClient(token=token).request("/user")
+        if isinstance(profile, dict) and profile.get("login"):
+            return
+    if not shutil.which("gh"):
+        raise RuntimeError(
+            "GitHub CLI (gh) is not installed. Install it (for example: brew install gh), "
+            "then rerun run_worklog.py; it will open GitHub browser login automatically."
+        )
+    print("GitHub login required. Complete the browser authentication opened by GitHub CLI.", file=sys.stderr)
+    result = subprocess.run(
+        ["gh", "auth", "login", "--web", "--hostname", "github.com", "--scopes", "repo,read:user,user:email"],
+        check=False,
+    )
+    if result.returncode != 0 or not get_github_token():
+        raise RuntimeError("GitHub browser authentication did not complete successfully.")
 
 if __name__ == "__main__":
     main()
