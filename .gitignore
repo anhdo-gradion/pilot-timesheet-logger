@@ -29,6 +29,7 @@ credentials.json
 token.json
 timesheet-logger/credentials.json
 timesheet-logger/token.json
+.timesheet-token-runs/
 
 # ==========================================
 # Logs and Databases

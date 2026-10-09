@@ -1,219 +1,135 @@
 #!/usr/bin/env python3
-"""
-[Script Step] track_token_usage.py
-Automatically tracks token usage for a SINGLE execution of the timesheet logging skill
-(from the user's prompt triggering the run to completion) across Codex, Claude Code, and Antigravity.
-Outputs structured metrics to token-usage.json.
-"""
+"""Measure native token usage for one worklog run across supported agent logs."""
 
+import argparse
+import glob
+import json
 import os
 import sys
-import json
-import glob
-import argparse
 import uuid
-from datetime import datetime, date, timezone
+from datetime import datetime, timezone
+
 
 DEFAULT_JSON_PATH = "token-usage.json"
+STATE_DIR = ".timesheet-token-runs"
+METRICS = ("input", "cached_input", "uncached_input", "output", "thinking", "total")
 
-def scan_files_safely(base_dir, pattern="*.jsonl"):
-    """Recursively scans directory for files matching pattern, silently handling permission errors."""
+
+def scan_files_safely(base_dir):
+    """List JSON/JSONL files below a supported agent data directory."""
     matches = []
     if not os.path.exists(base_dir):
         return matches
     try:
-        for root, dirs, files in os.walk(base_dir, onerror=lambda e: None):
-            for f in files:
-                if f.endswith(".jsonl"):
-                    matches.append(os.path.join(root, f))
-    except Exception:
+        for root, _dirs, files in os.walk(base_dir, onerror=lambda _error: None):
+            if "chunks" in root or "messages" in root:
+                continue
+            for filename in files:
+                if filename == "transcript_full.jsonl":
+                    continue
+                if filename.endswith((".jsonl", ".json")):
+                    matches.append(os.path.join(root, filename))
+    except OSError:
         pass
     return matches
 
+
 def find_session_transcripts():
-    """
-    Finds transcript .jsonl files across supported agent systems:
-    1. Local workspace (rollout-*.jsonl, transcript.jsonl)
-    2. Codex CLI / Desktop (~/.codex/sessions/**/rollout-*.jsonl)
-    3. Claude Code (~/.claude/**/*.jsonl)
-    4. Antigravity conversation logs
-    """
+    """Find possible local transcript paths; run markers select the actual sessions."""
     home = os.path.expanduser("~")
-    candidates = []
-
-    # 1. Local workspace files (e.g. copied rollout logs or local runs)
+    paths = []
     cwd = os.getcwd()
-    for f in glob.glob(os.path.join(cwd, "rollout-*.jsonl")):
-        candidates.append(f)
-    for f in glob.glob(os.path.join(cwd, "*transcript*.jsonl")):
-        candidates.append(f)
+    paths.extend(glob.glob(os.path.join(cwd, "rollout-*.jsonl")))
+    paths.extend(glob.glob(os.path.join(cwd, "*transcript*.jsonl")))
 
-    # 2. Codex CLI & Desktop sessions (~/.codex/sessions/YYYY-MM/DD/rollout-*.jsonl)
-    codex_paths = [
+    roots = (
         os.path.join(home, ".codex", "sessions"),
-        os.path.join(home, ".codex"),
-        os.path.join(home, "Library", "Application Support", "Codex", "sessions")
-    ]
-    for c_dir in codex_paths:
-        for f in scan_files_safely(c_dir):
-            if "rollout-" in os.path.basename(f) and f not in candidates:
-                candidates.append(f)
+        os.path.join(home, "Library", "Application Support", "Codex", "sessions"),
+        os.path.join(home, ".claude"),
+        os.path.join(home, ".gemini", "antigravity", "brain"),
+        os.path.join(home, ".gemini", "antigravity-cli", "brain"),
+    )
+    for root in roots:
+        paths.extend(scan_files_safely(root))
 
-    # 3. Claude Code sessions (~/.claude/**/*.jsonl)
-    claude_base = os.path.join(home, ".claude")
-    for f in scan_files_safely(claude_base):
-        if f not in candidates:
-            candidates.append(f)
+    brain_dir = os.environ.get("ANTIGRAVITY_BRAIN_DIR")
+    if brain_dir:
+        paths.extend(scan_files_safely(brain_dir))
+    return sorted(set(paths))
 
-    # 4. Antigravity conversation logs
-    env_brain = os.environ.get("ANTIGRAVITY_BRAIN_DIR")
-    if env_brain:
-        agy_log = os.path.join(env_brain, ".system_generated", "logs", "transcript.jsonl")
-        if os.path.exists(agy_log) and agy_log not in candidates:
-            candidates.append(agy_log)
-    else:
-        # Search ~/.gemini/antigravity/brain
-        agy_base = os.path.join(home, ".gemini", "antigravity", "brain")
-        for f in scan_files_safely(agy_base):
-            if f.endswith("transcript.jsonl") and f not in candidates:
-                candidates.append(f)
 
-    return candidates
+def transcript_snapshot():
+    """Capture metadata so finalization only inspects files touched during this run."""
+    snapshot = {}
+    for path in find_session_transcripts():
+        try:
+            stat = os.stat(path)
+            snapshot[path] = {"mtime_ns": stat.st_mtime_ns, "size": stat.st_size}
+        except OSError:
+            continue
+    return snapshot
 
-def detect_and_parse_transcript(file_path, single_run=True):
-    """
-    Detects format (Codex, Claude Code, Antigravity) and computes token consumption.
-    If single_run=True, isolates tokens for the latest user turn/request.
-    If single_run=False, calculates tokens for the entire session.
-    """
-    if not os.path.exists(file_path):
-        return None
 
+def read_json_lines(path):
     items = []
     try:
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
+        with open(path, "r", encoding="utf-8", errors="replace") as transcript:
+            for line in transcript:
                 line = line.strip()
-                if line:
-                    try:
-                        items.append(json.loads(line))
-                    except Exception:
-                        continue
-    except Exception as e:
-        print(f"Error reading {file_path}: {e}", file=sys.stderr)
-        return None
+                if not line:
+                    continue
+                try:
+                    items.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError as error:
+        print(f"Could not read transcript {path}: {error}", file=sys.stderr)
+    return items
 
-    if not items:
-        return None
 
-    # Detect format
-    format_type = "claude"
-    for item in items[:30]:
-        t = item.get("type")
-        if t in ("token_usage_record", "session_meta", "turn_context"):
-            format_type = "codex"
-            break
-        if t in ("USER_INPUT", "PLANNER_RESPONSE"):
-            format_type = "antigravity"
-            break
-        if t in ("user", "assistant") and ("message" in item or "usage" in item):
-            format_type = "claude"
-            break
-
-    # Parse based on detected format
-    if format_type == "codex":
-        return parse_codex(items, file_path, single_run)
-    elif format_type == "antigravity":
-        return parse_antigravity(items, file_path, single_run)
-    else:
-        return parse_claude(items, file_path, single_run)
-
-def parse_codex(items, file_path, single_run):
-    turns = {}
-    current_turn_id = None
-    user_prompts = {}
-    pending_tools = {}
-    session_id = os.path.splitext(os.path.basename(file_path))[0]
-
+def detect_format(items):
     for item in items:
-        t = item.get("type")
-        p = item.get("payload", {})
-        if not isinstance(p, dict):
-            continue
+        if item.get("type") == "token_usage_record":
+            return "codex"
+        if item.get("event") == "step_update" or isinstance(item.get("step_update"), dict):
+            return "antigravity"
+    if any(item.get("type") in ("USER_INPUT", "PLANNER_RESPONSE") for item in items):
+        return "antigravity"
+    if any(item.get("type") in ("user", "assistant") or item.get("role") in ("user", "assistant") for item in items):
+        return "claude"
+    return "unknown"
 
-        if t == "session_meta" and p.get("session_id"):
-            session_id = p.get("session_id")
 
-        if t == "turn_context" and p.get("turn_id"):
-            current_turn_id = p.get("turn_id")
+def serialized(item):
+    return json.dumps(item, ensure_ascii=False, separators=(",", ":"))
 
-        if t == "response_item" and p.get("type") in ("custom_tool_call", "function_call"):
-            tid = p.get("turn_id", current_turn_id or "default")
-            pending_tools.setdefault(tid, []).append(p.get("input", ""))
 
-        if t == "response_item" and p.get("role") == "user":
-            content = p.get("content", [])
-            text = ""
-            if isinstance(content, list):
-                for c in content:
-                    txt = c.get("text", "") if isinstance(c, dict) else str(c)
-                    if not txt.startswith(("# AGENTS.md", "<environment_context>", "<external_codex_apps", "<app-context>", "<codex_apps", "<multi_agent")):
-                        text += txt
-            elif isinstance(content, str):
-                text = content
-            text = text.strip()
-            if text:
-                tid = current_turn_id or f"turn_{len(user_prompts)}"
-                user_prompts[tid] = text
+def has_marker(item, run_id):
+    return run_id in serialized(item)
 
-        if t == "token_usage_record":
-            tid = p.get("turn_id", current_turn_id or "default")
-            turns.setdefault(tid, []).append({"usage": p.get("usage", {}), "tools": pending_tools.pop(tid, [])})
 
-    if not turns:
-        return None
+def empty_metrics():
+    return {metric: 0 for metric in METRICS}
 
-    latest_turn_id = list(turns.keys())[-1]
-    if single_run:
-        target_records = turns[latest_turn_id]
-        prompt = user_prompts.get(latest_turn_id, "Run timesheet workflow")
-        turn_scope_id = latest_turn_id
-    else:
-        target_records = [r for r_list in turns.values() for r in r_list]
-        prompt = "Full session"
-        turn_scope_id = session_id
 
-    total_input = sum(r.get("usage", {}).get("input_tokens", 0) for r in target_records)
-    total_output = sum(r.get("usage", {}).get("output_tokens", 0) for r in target_records)
-    total_cache = sum(r.get("usage", {}).get("cached_input_tokens", 0) + r.get("usage", {}).get("cache_write_input_tokens", 0) for r in target_records)
-    step_usage = {}
-    for record in target_records:
-        step = classify_codex_step(record.get("tools", []))
-        bucket = step_usage.setdefault(step, {"input": 0, "output": 0, "cache": 0, "total": 0})
-        usage = record.get("usage", {})
-        bucket["input"] += usage.get("input_tokens", 0)
-        bucket["output"] += usage.get("output_tokens", 0)
-        bucket["cache"] += usage.get("cached_input_tokens", 0) + usage.get("cache_write_input_tokens", 0)
-        bucket["total"] += usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
-    total_tokens = total_input + total_output
-
+def normalize_metrics(input_tokens, cached_tokens, output_tokens, thinking_tokens=0):
+    input_tokens = max(int(input_tokens or 0), 0)
+    cached_tokens = max(min(int(cached_tokens or 0), input_tokens), 0)
+    output_tokens = max(int(output_tokens or 0), 0)
+    thinking_tokens = max(int(thinking_tokens or 0), 0)
     return {
-        "agent": "codex",
-        "session_id": session_id,
-        "turn_id": turn_scope_id,
-        "scope": "single_run" if single_run else "full_session",
-        "prompt": prompt,
-        "input_tokens": total_input,
-        "output_tokens": total_output,
-        "cache_tokens": total_cache,
-        "total_tokens": total_tokens,
-        "step_usage": step_usage,
-        "step_attribution": "tool_call_adjacent"
+        "input": input_tokens,
+        "cached_input": cached_tokens,
+        "uncached_input": input_tokens - cached_tokens,
+        "output": output_tokens,
+        "thinking": thinking_tokens,
+        "total": input_tokens + output_tokens + thinking_tokens,
     }
 
-def classify_codex_step(tool_inputs):
-    text = " ".join(value if isinstance(value, str) else json.dumps(value) for value in tool_inputs).lower()
-    if "collect_work.py" in text or "collect_github.py" in text or "collect_calendar.py" in text:
+
+def classify_step(tool_inputs):
+    text = " ".join(value if isinstance(value, str) else json.dumps(value, ensure_ascii=False) for value in tool_inputs).lower()
+    if any(name in text for name in ("collect_work.py", "collect_github.py", "collect_calendar.py")):
         return "collect_sources"
     if "track_token_usage.py" in text and "begin" in text:
         return "start_measurement"
@@ -221,290 +137,522 @@ def classify_codex_step(tool_inputs):
         return "finalize_measurement"
     return "worklog_synthesis"
 
-def parse_antigravity(items, file_path, single_run):
-    session_id = os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(file_path))))
-    target_items = items
-    prompt = "Full session"
 
-    if single_run:
-        last_user_idx = -1
-        for i, it in enumerate(items):
-            if it.get("type") == "USER_INPUT":
-                last_user_idx = i
-                prompt = str(it.get("content", ""))[:120].strip()
-        if last_user_idx != -1:
-            target_items = items[last_user_idx:]
+def add_response(responses, response_id, step, metrics):
+    responses.append({"response_id": str(response_id), "step": step, "tokens": metrics})
 
-    total_input = sum(it.get("input_tokens", 0) for it in target_items if isinstance(it.get("input_tokens"), int))
-    total_output = sum(it.get("output_tokens", 0) for it in target_items if isinstance(it.get("output_tokens"), int))
-    total_cache = sum(it.get("cache_read_tokens", 0) for it in target_items if isinstance(it.get("cache_read_tokens"), int))
-    total_tokens = total_input + total_output
-    step_usage = {}
-    for item in target_items:
-        inp = item.get("input_tokens", 0)
-        out = item.get("output_tokens", 0)
-        cache = item.get("cache_read_tokens", 0)
-        if not isinstance(inp, int) or not isinstance(out, int):
+
+def sum_response_metrics(responses):
+    total = empty_metrics()
+    steps = {}
+    for response in responses:
+        metrics = response["tokens"]
+        for metric in METRICS:
+            total[metric] += metrics.get(metric, 0)
+        bucket = steps.setdefault(response["step"], empty_metrics())
+        for metric in METRICS:
+            bucket[metric] += metrics.get(metric, 0)
+    return total, steps
+
+
+def base_component(agent, session_id, run_id, path):
+    return {
+        "agent": agent,
+        "agent_id": None,
+        "root_turn_ids": [],
+        "session_id": session_id,
+        "turn_ids": [],
+        "run_id": run_id,
+        "status": "unavailable",
+        "reason": None,
+        "attribution": "unavailable",
+        "responses": [],
+        "tokens": None,
+        "step_usage": {},
+        "transcript_path": os.path.abspath(path),
+    }
+
+
+def parse_codex(items, path, run_id):
+    session_id = os.path.splitext(os.path.basename(path))[0]
+    current_turn_id = None
+    marker_turns = set()
+    end_marker_indexes = []
+    for index, item in enumerate(items):
+        payload = item.get("payload", {})
+        if not isinstance(payload, dict):
+            payload = {}
+        if item.get("type") == "session_meta":
+            session_id = payload.get("session_id", session_id)
+        if item.get("type") == "turn_context" and payload.get("turn_id"):
+            current_turn_id = payload["turn_id"]
+        turn_id = payload.get("turn_id") or current_turn_id
+        if has_marker(item, run_id) and turn_id:
+            marker_turns.add(str(turn_id))
+            if item.get("type") == "response_item" and payload.get("type") in ("custom_tool_call", "function_call"):
+                call_text = serialized(payload).lower()
+                if "track_token_usage.py" in call_text and "finalize" in call_text:
+                    end_marker_indexes.append(index)
+
+    component = base_component("codex", session_id, run_id, path)
+    if not marker_turns:
+        component["reason"] = "run_marker_not_found"
+        return component
+
+    end_index = len(items) - 1
+    if end_marker_indexes:
+        finalizer_index = min(end_marker_indexes)
+        end_index = finalizer_index
+        for index in range(finalizer_index + 1, len(items)):
+            item = items[index]
+            payload = item.get("payload", {})
+            if item.get("type") == "token_usage_record" and str(payload.get("turn_id", "")) in marker_turns:
+                end_index = index
+                break
+            if item.get("type") == "response_item" and payload.get("type") == "custom_tool_call_output":
+                break
+
+    pending_tools = {}
+    seen_responses = set()
+    current_turn_id = None
+    for index, item in enumerate(items[:end_index + 1]):
+        payload = item.get("payload", {})
+        if not isinstance(payload, dict):
             continue
-        step = classify_codex_step([json.dumps(item, ensure_ascii=False)])
-        bucket = step_usage.setdefault(step, {"input": 0, "output": 0, "cache": 0, "total": 0})
-        bucket["input"] += inp
-        bucket["output"] += out
-        bucket["cache"] += cache if isinstance(cache, int) else 0
-        bucket["total"] += inp + out
+        if item.get("type") == "turn_context" and payload.get("turn_id"):
+            current_turn_id = str(payload["turn_id"])
+        if item.get("type") == "response_item" and payload.get("type") in ("custom_tool_call", "function_call"):
+            turn_id = str(payload.get("turn_id") or current_turn_id or "")
+            if turn_id in marker_turns:
+                pending_tools.setdefault(turn_id, []).append(payload.get("input", ""))
+        if item.get("type") != "token_usage_record":
+            continue
+        turn_id = str(payload.get("turn_id") or current_turn_id or "")
+        if turn_id not in marker_turns:
+            continue
+        response_id = payload.get("response_id") or f"{turn_id}:{index}"
+        if response_id in seen_responses:
+            continue
+        usage = payload.get("usage", {})
+        if not isinstance(usage, dict) or not isinstance(usage.get("input_tokens"), int) or not isinstance(usage.get("output_tokens"), int):
+            continue
+        seen_responses.add(response_id)
+        cached = usage.get("cached_input_tokens", 0) + usage.get("cache_write_input_tokens", 0)
+        metrics = normalize_metrics(usage["input_tokens"], cached, usage["output_tokens"])
+        tools = pending_tools.pop(turn_id, [])
+        add_response(component["responses"], response_id, classify_step(tools), metrics)
+        if turn_id not in component["turn_ids"]:
+            component["turn_ids"].append(turn_id)
+        # Preserve Codex root-turn metadata without treating it as a subagent identifier.
+        root_turn_id = payload.get("root_turn_id")
+        if root_turn_id and str(root_turn_id) not in component["root_turn_ids"]:
+            component["root_turn_ids"].append(str(root_turn_id))
+        agent_id = payload.get("subagent_id") or payload.get("agent_id")
+        if agent_id:
+            component["agent_id"] = str(agent_id)
 
-    return {
-        "agent": "antigravity",
-        "session_id": session_id,
-        "turn_id": session_id,
-        "scope": "single_run" if single_run else "full_session",
-        "prompt": prompt,
-        "input_tokens": total_input,
-        "output_tokens": total_output,
-        "cache_tokens": total_cache,
-        "total_tokens": total_tokens,
-        "step_usage": step_usage,
-        "step_attribution": "transcript_marker"
-    }
-
-def parse_claude(items, file_path, single_run):
-    session_id = os.path.splitext(os.path.basename(file_path))[0]
-    target_items = items
-    prompt = "Full session"
-
-    if single_run:
-        last_user_idx = -1
-        for i, it in enumerate(items):
-            if it.get("type") == "user" or it.get("role") == "user":
-                msg_content = it.get("message", {}).get("content", "") or it.get("content", "")
-                if isinstance(msg_content, list):
-                    text_parts = [block.get("text", "") for block in msg_content if isinstance(block, dict) and block.get("type") == "text"]
-                    prompt_text = " ".join(text_parts).strip()
-                else:
-                    prompt_text = str(msg_content).strip()
-                # Claude transcripts also encode tool results as user messages; only a human text prompt starts a run.
-                if prompt_text:
-                    last_user_idx = i
-                    prompt = prompt_text[:120]
-        if last_user_idx != -1:
-            target_items = items[last_user_idx:]
-
-    total_input = 0
-    total_output = 0
-    total_cache = 0
-    step_usage = {}
-
-    for it in target_items:
-        usage = it.get("usage") or it.get("message", {}).get("usage")
-        if isinstance(usage, dict):
-            inp = usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0)
-            out = usage.get("output_tokens", 0) or usage.get("completion_tokens", 0)
-            cache_r = usage.get("cache_read_input_tokens", 0) or usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)
-            cache_c = usage.get("cache_creation_input_tokens", 0)
-
-            total_input += inp
-            total_output += out
-            total_cache += (cache_r + cache_c)
-            content = it.get("message", {}).get("content", [])
-            tool_inputs = []
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "tool_use":
-                        tool_inputs.append(json.dumps({"name": block.get("name"), "input": block.get("input", {})}, ensure_ascii=False))
-            step = classify_codex_step(tool_inputs)
-            bucket = step_usage.setdefault(step, {"input": 0, "output": 0, "cache": 0, "total": 0})
-            bucket["input"] += inp
-            bucket["output"] += out
-            bucket["cache"] += cache_r + cache_c
-            bucket["total"] += inp + out
-
-    return {
-        "agent": "claude",
-        "session_id": session_id,
-        "turn_id": session_id,
-        "scope": "single_run" if single_run else "full_session",
-        "prompt": prompt,
-        "input_tokens": total_input,
-        "output_tokens": total_output,
-        "cache_tokens": total_cache,
-        "total_tokens": total_input + total_output,
-        "step_usage": step_usage,
-        "step_attribution": "tool_call_adjacent"
-    }
-
-def update_json_records(json_path, new_record):
-    """Appends or updates run metrics in token-usage.json."""
-    records = []
-    if os.path.exists(json_path):
-        try:
-            with open(json_path, "r", encoding="utf-8") as f:
-                content = f.read().strip()
-                if content:
-                    loaded = json.loads(content)
-                    if isinstance(loaded, list):
-                        records = loaded
-        except Exception:
-            records = []
-
-    # Check if record for same turn/session already exists; if so, update it
-    match_index = -1
-    for idx, r in enumerate(records):
-        if new_record.get("run_id") and r.get("run_id") == new_record["run_id"]:
-            match_index = idx
-            break
-        if r.get("session_id") == new_record["session_id"] and r.get("turn_id") == new_record.get("turn_id") and r.get("scope") == new_record["scope"]:
-            match_index = idx
-            break
-
-    if match_index != -1:
-        records[match_index] = new_record
+    if component["responses"]:
+        component["status"] = "measured"
+        component["attribution"] = "tool_call_adjacent"
+        component["tokens"], component["step_usage"] = sum_response_metrics(component["responses"])
     else:
-        records.append(new_record)
+        component["reason"] = "native_usage_not_found_for_run"
+    return component
 
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(records, f, indent=2, ensure_ascii=False)
 
-def run_state_path(run_id):
-    return os.path.join(".timesheet-token-runs", f"{run_id}.json")
+def claude_text(item):
+    message = item.get("message", {})
+    content = message.get("content", item.get("content", ""))
+    if isinstance(content, str):
+        return content
+    parts = []
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "text":
+                    parts.append(block.get("text", ""))
+                elif block.get("type") == "tool_result":
+                    continue
+    return " ".join(parts)
+
+
+def claude_tool_inputs(item):
+    message = item.get("message", {})
+    content = message.get("content", item.get("content", []))
+    inputs = []
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                inputs.append({"name": block.get("name"), "input": block.get("input", {})})
+    return inputs
+
+
+def parse_claude(items, path, run_id):
+    session_id = None
+    marker_indexes = [index for index, item in enumerate(items) if has_marker(item, run_id)]
+    component = base_component("claude", "unknown", run_id, path)
+    if not marker_indexes:
+        component["reason"] = "run_marker_not_found"
+        return component
+
+    for item in items:
+        if item.get("sessionId") or item.get("session_id"):
+            session_id = item.get("sessionId") or item.get("session_id")
+            break
+    if not session_id:
+        session_id = os.path.splitext(os.path.basename(path))[0]
+    component["session_id"] = str(session_id)
+
+    first_marker = marker_indexes[0]
+    start_index = first_marker
+    for index in range(first_marker, -1, -1):
+        item = items[index]
+        if item.get("type") == "user" or item.get("role") == "user":
+            if claude_text(item).strip():
+                start_index = index
+                break
+
+    finalizer_indexes = []
+    for index in marker_indexes:
+        item = items[index]
+        text = serialized(item).lower()
+        if "track_token_usage.py" in text and "finalize" in text:
+            finalizer_indexes.append(index)
+    # Stop at the finalizer request, whose assistant usage is already in its message.
+    # This excludes the visible final answer emitted after the tool returns.
+    end_index = min(finalizer_indexes) if finalizer_indexes else len(items) - 1
+    if not finalizer_indexes:
+        for index in range(first_marker + 1, len(items)):
+            item = items[index]
+            if (item.get("type") == "user" or item.get("role") == "user") and claude_text(item).strip():
+                end_index = index - 1
+                break
+
+    seen_responses = set()
+    for index, item in enumerate(items[start_index:end_index + 1], start=start_index):
+        if item.get("type") not in ("assistant", None) and item.get("role") != "assistant":
+            continue
+        message = item.get("message", {})
+        usage = item.get("usage") or message.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        input_tokens = usage.get("input_tokens", usage.get("prompt_tokens"))
+        output_tokens = usage.get("output_tokens", usage.get("completion_tokens"))
+        if not isinstance(input_tokens, int) or not isinstance(output_tokens, int):
+            continue
+        cache_read = usage.get("cache_read_input_tokens", 0)
+        cache_write = usage.get("cache_creation_input_tokens", 0)
+        if not isinstance(cache_read, int):
+            cache_read = 0
+        if not isinstance(cache_write, int):
+            cache_write = 0
+        # Anthropic reports uncached input separately from cache read/write input.
+        metrics = normalize_metrics(input_tokens + cache_read + cache_write, cache_read + cache_write, output_tokens)
+        response_id = message.get("id") or item.get("requestId") or item.get("uuid") or f"{session_id}:{index}"
+        if response_id in seen_responses:
+            continue
+        seen_responses.add(response_id)
+        add_response(component["responses"], response_id, classify_step(claude_tool_inputs(item)), metrics)
+        turn_id = item.get("turn_id") or item.get("parentUuid")
+        if turn_id and str(turn_id) not in component["turn_ids"]:
+            component["turn_ids"].append(str(turn_id))
+
+    if component["responses"]:
+        component["status"] = "measured"
+        component["attribution"] = "tool_call_adjacent"
+        component["tokens"], component["step_usage"] = sum_response_metrics(component["responses"])
+    else:
+        component["reason"] = "native_usage_not_found_for_run"
+    return component
+
+
+def antigravity_step(item):
+    value = item.get("step_update")
+    if not isinstance(value, dict):
+        value = item.get("data", {}).get("step_update", {}) if isinstance(item.get("data"), dict) else {}
+    return value if isinstance(value, dict) else {}
+
+
+def parse_antigravity(items, path, run_id):
+    marker_indexes = [index for index, item in enumerate(items) if has_marker(item, run_id)]
+    if not marker_indexes:
+        component = base_component("antigravity", "unknown", run_id, path)
+        component["reason"] = "run_marker_not_found"
+        return [component]
+
+    markers_by_conversation = {}
+    for index in marker_indexes:
+        event = antigravity_step(items[index])
+        conversation_id = event.get("conversation_id") or items[index].get("conversation_id")
+        if conversation_id:
+            markers_by_conversation.setdefault(str(conversation_id), []).append(index)
+    if not markers_by_conversation:
+        # Some transcript versions store the run marker in a user/tool event without a
+        # conversation ID. Use the file only when it contains exactly one native session.
+        conversations = set()
+        for item in items:
+            event = antigravity_step(item)
+            conversation_id = event.get("conversation_id") or item.get("conversation_id")
+            if conversation_id:
+                conversations.add(str(conversation_id))
+        if len(conversations) == 1:
+            markers_by_conversation[next(iter(conversations))] = marker_indexes
+        else:
+            session_hint = os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(path)))) or "unknown"
+            markers_by_conversation[session_hint] = marker_indexes
+
+    components = []
+    session_hint = os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(path)))) or "unknown"
+    for conversation_id, conversation_markers in markers_by_conversation.items():
+        component = base_component("antigravity", conversation_id, run_id, path)
+        start_index = min(conversation_markers)
+        for index in range(start_index, -1, -1):
+            event = antigravity_step(items[index])
+            item_conversation = event.get("conversation_id") or items[index].get("conversation_id") or session_hint
+            if items[index].get("type") == "USER_INPUT" and (not item_conversation or str(item_conversation) == conversation_id):
+                start_index = index
+                break
+        end_index = len(items) - 1
+        for index in conversation_markers:
+            text = serialized(items[index]).lower()
+            if "track_token_usage.py" in text and "finalize" in text:
+                end_index = index
+                finalizer_step = antigravity_step(items[index]).get("step_index")
+                if finalizer_step is not None:
+                    for next_index in range(index + 1, len(items)):
+                        event = antigravity_step(items[next_index])
+                        if str(event.get("step_index")) == str(finalizer_step) and str(event.get("state", "")).upper() in ("DONE", "COMPLETED"):
+                            end_index = next_index
+                            break
+                break
+        else:
+            latest_marker = max(conversation_markers)
+            for index in range(latest_marker + 1, len(items)):
+                event = antigravity_step(items[index])
+                item_conversation = event.get("conversation_id") or items[index].get("conversation_id") or session_hint
+                if items[index].get("type") == "USER_INPUT" and (not item_conversation or str(item_conversation) == conversation_id):
+                    end_index = index - 1
+                    break
+
+        # Headless streaming can emit several updates for one step. Keep its final native usage once.
+        final_steps = {}
+        for item in items[start_index:end_index + 1]:
+            event = antigravity_step(item)
+            item_conversation = event.get("conversation_id") or item.get("conversation_id") or session_hint
+            if str(item_conversation) != conversation_id:
+                continue
+            usage = event.get("usage")
+            step_index = event.get("step_index") if event.get("step_index") is not None else item.get("step_index")
+            if not isinstance(usage, dict):
+                if isinstance(item.get("input_tokens"), int) or isinstance(item.get("output_tokens"), int):
+                    usage = {
+                        "input_tokens": item.get("input_tokens", 0),
+                        "output_tokens": item.get("output_tokens", 0),
+                        "cache_read_tokens": item.get("cache_read_tokens", 0),
+                        "cache_write_tokens": item.get("cache_write_tokens", 0),
+                        "thinking_tokens": item.get("thinking_tokens", 0),
+                        "total_tokens": item.get("input_tokens", 0) + item.get("output_tokens", 0),
+                    }
+                else:
+                    continue
+            if step_index is None:
+                continue
+            state = str(event.get("state") or item.get("status") or "").upper()
+            if state not in ("DONE", "COMPLETED"):
+                continue
+            final_steps[(conversation_id, str(step_index))] = (event if event else item, usage)
+
+        for (step_conversation, step_index), (event, usage) in sorted(final_steps.items()):
+            input_tokens = usage.get("input_tokens")
+            output_tokens = usage.get("output_tokens")
+            if not isinstance(input_tokens, int) or not isinstance(output_tokens, int):
+                continue
+            cache_read = usage.get("cache_read_tokens", 0)
+            cache_write = usage.get("cache_write_tokens", 0)
+            thinking = usage.get("thinking_tokens", 0)
+            metrics = normalize_metrics(input_tokens, cache_read + cache_write, output_tokens, thinking)
+            native_total = usage.get("total_tokens")
+            if isinstance(native_total, int) and native_total >= 0:
+                metrics["total"] = native_total
+            response_id = f"{step_conversation}:{step_index}"
+            step_name = (
+                event.get("tool_name")
+                or (event.get("tool_calls", [{}])[0].get("name") if event.get("tool_calls") else None)
+                or event.get("step_type")
+                or event.get("type")
+                or "unknown"
+            )
+            stage = classify_step([step_name, event.get("text", "") or event.get("content", "")])
+            if stage == "worklog_synthesis":
+                stage = f"antigravity:{step_name}"
+            add_response(component["responses"], response_id, stage, metrics)
+        if component["responses"]:
+            component["status"] = "measured"
+            component["attribution"] = "native_step"
+            component["tokens"], component["step_usage"] = sum_response_metrics(component["responses"])
+        else:
+            component["reason"] = "native_step_usage_not_found_for_run"
+        components.append(component)
+    return components
+
+
+def parse_transcript(path, run_id):
+    items = read_json_lines(path)
+    if not items:
+        return None
+    transcript_format = detect_format(items)
+    if transcript_format == "codex":
+        return [parse_codex(items, path, run_id)]
+    if transcript_format == "claude":
+        return [parse_claude(items, path, run_id)]
+    if transcript_format == "antigravity":
+        return parse_antigravity(items, path, run_id)
+    return None
+
+
+def state_path(run_id):
+    normalized_id = str(uuid.UUID(run_id))
+    return os.path.join(STATE_DIR, f"{normalized_id}.json")
+
 
 def begin_run(run_id=None, prompt=""):
-    """Mark the beginning of a worklog request; usage is collected when finalized."""
     run_id = run_id or str(uuid.uuid4())
-    started_at = datetime.now(timezone.utc)
     state = {
         "run_id": run_id,
-        "started_at": started_at.isoformat(),
+        "started_at": datetime.now(timezone.utc).isoformat(),
         "prompt": prompt[:240],
-        "transcripts_before": find_session_transcripts()
+        "transcripts_before": transcript_snapshot(),
     }
-    path = run_state_path(run_id)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as state_file:
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(state_path(run_id), "w", encoding="utf-8") as state_file:
         json.dump(state, state_file, indent=2, ensure_ascii=False)
     return state
 
-def finalize_run(run_id, output_path=DEFAULT_JSON_PATH, transcript_paths=None, ended_at=None):
-    """Aggregate the latest prompt-to-response turn from every active agent transcript."""
-    state_path = run_state_path(run_id)
-    with open(state_path, "r", encoding="utf-8") as state_file:
-        state = json.load(state_file)
-    started = datetime.fromisoformat(state["started_at"])
-    ended = ended_at or datetime.now(timezone.utc)
-    explicit_paths = list(transcript_paths or [])
-    candidates = explicit_paths or find_session_transcripts()
-    before = set(state.get("transcripts_before", []))
-    active_paths = []
-    for path in candidates:
-        if not os.path.isfile(path):
+
+def changed_transcripts(snapshot):
+    changed = []
+    for path in find_session_transcripts():
+        try:
+            stat = os.stat(path)
+        except OSError:
             continue
-        # Explicit paths are authoritative. Otherwise include files created or updated during this run.
-        if explicit_paths or path not in before or datetime.fromtimestamp(os.path.getmtime(path), timezone.utc) >= started:
-            active_paths.append(path)
+        before = snapshot.get(path)
+        if before is None or before.get("size") != stat.st_size or before.get("mtime_ns") != stat.st_mtime_ns:
+            changed.append(path)
+    return changed
+
+
+def update_json_records(json_path, record):
+    records = []
+    if os.path.exists(json_path):
+        try:
+            with open(json_path, "r", encoding="utf-8") as source:
+                loaded = json.load(source)
+            if isinstance(loaded, list):
+                records = loaded
+        except (OSError, json.JSONDecodeError):
+            records = []
+
+    match_index = next((index for index, old in enumerate(records) if record.get("run_id") and old.get("run_id") == record["run_id"]), None)
+    if match_index is None:
+        records.append(record)
+    else:
+        records[match_index] = record
+    with open(json_path, "w", encoding="utf-8") as target:
+        json.dump(records, target, indent=2, ensure_ascii=False)
+
+
+def finalize_run(run_id, output_path=DEFAULT_JSON_PATH, transcript_paths=None):
+    run_state_path = state_path(run_id)
+    try:
+        with open(run_state_path, "r", encoding="utf-8") as state_file:
+            state = json.load(state_file)
+        state_missing = False
+    except FileNotFoundError:
+        # A missed/failed `begin` should not silently prevent any usage record.
+        state = {"run_id": run_id, "started_at": None, "prompt": "", "transcripts_before": {}}
+        state_missing = True
+    explicit_paths = list(dict.fromkeys(transcript_paths or []))
+    paths = explicit_paths or changed_transcripts(state.get("transcripts_before", {}))
 
     components = []
-    seen = set()
-    for path in active_paths:
-        stats = detect_and_parse_transcript(path, single_run=True)
-        if not stats:
+    identities = set()
+    for path in paths:
+        parsed_components = parse_transcript(path, run_id)
+        if not parsed_components:
             continue
-        identity = (stats.get("agent"), stats.get("session_id"))
-        if identity in seen:
-            continue
-        seen.add(identity)
-        components.append({
-            "agent": stats["agent"],
-            "session_id": stats["session_id"],
-            "turn_id": stats.get("turn_id"),
-            "input": stats["input_tokens"],
-            "output": stats["output_tokens"],
-            "cache": stats["cache_tokens"],
-            "total": stats["total_tokens"],
-            "steps": stats.get("step_usage", {}),
-            "step_attribution": stats.get("step_attribution", "unavailable"),
-            "transcript_path": os.path.abspath(path)
-        })
+        for component in parsed_components:
+            if component.get("reason") == "run_marker_not_found":
+                continue
+            identity = (component.get("agent"), component.get("session_id"), tuple(component.get("turn_ids", [])))
+            if identity in identities:
+                continue
+            identities.add(identity)
+            components.append(component)
 
-    total_input = sum(item["input"] for item in components)
-    total_output = sum(item["output"] for item in components)
-    total_cache = sum(item["cache"] for item in components)
-    step_usage = {}
+    if not components:
+        reason = "run_state_missing" if state_missing else ("no_changed_transcript_found" if not paths else "run_marker_not_found")
+        component = base_component("unknown", "unknown", run_id, "unavailable")
+        component["reason"] = reason
+        components.append(component)
+
+    measured_totals = empty_metrics()
     for component in components:
-        for step, metrics in component["steps"].items():
-            bucket = step_usage.setdefault(step, {"input": 0, "output": 0, "cache": 0, "total": 0})
-            for metric in bucket:
-                bucket[metric] += metrics.get(metric, 0)
-    highest_cost_step = max(step_usage, key=lambda step: step_usage[step]["total"]) if step_usage else None
-    agents = sorted(set(item["agent"] for item in components))
+        if component["status"] != "measured":
+            continue
+        for metric in METRICS:
+            measured_totals[metric] += component["tokens"].get(metric, 0)
+    measured_count = sum(component["status"] == "measured" for component in components)
+    valid_agents = sorted({component["agent"] for component in components if component.get("agent") and component.get("agent") != "unknown"})
+    primary_agent = ", ".join(valid_agents) if valid_agents else (components[0].get("agent", "unknown") if components else "unknown")
+    ended = datetime.now(timezone.utc)
     record = {
         "date": ended.astimezone().strftime("%Y-%m-%d"),
         "timestamp": ended.astimezone().strftime("%Y-%m-%d %H:%M:%S"),
-        "scope": "worklog_run",
-        "run_id": run_id,
-        "started_at": state["started_at"],
-        "completed_at": ended.isoformat(),
+        "agent": primary_agent,
         "trigger_prompt": state.get("prompt", ""),
-        "agents": agents,
-        "sessions": components,
-        "step_usage": step_usage,
-        "highest_cost_step": highest_cost_step,
+        "run_id": run_id,
         "tokens": {
-            "input": total_input,
-            "output": total_output,
-            "cache": total_cache,
-            "total": total_input + total_output
-        },
-        "status": "measured" if components else "transcript_unavailable"
+            "input": measured_totals["input"],
+            "output": measured_totals["output"],
+            "cache": measured_totals["cached_input"],
+            "total": measured_totals["total"],
+        } if measured_count else None,
     }
-    update_json_records(output_path, record)
-    os.remove(state_path)
+    if measured_count:
+        update_json_records(output_path, record)
+    if not state_missing:
+        os.remove(run_state_path)
     return record
 
+
 def main():
-    parser = argparse.ArgumentParser(description="Track token usage for an end-to-end worklog run.")
-    subparsers = parser.add_subparsers(dest="command")
-    begin = subparsers.add_parser("begin", help="Start a worklog token measurement")
+    parser = argparse.ArgumentParser(description="Measure native token usage for one worklog run.")
+    commands = parser.add_subparsers(dest="command")
+    begin = commands.add_parser("begin", help="Start a token measurement run")
     begin.add_argument("--run-id")
     begin.add_argument("--prompt", default="")
-    finalize = subparsers.add_parser("finalize", help="Aggregate active agent transcripts for a run")
+    finalize = commands.add_parser("finalize", help="Finalize token measurement for a run")
     finalize.add_argument("--run-id", required=True)
     finalize.add_argument("--output", default=DEFAULT_JSON_PATH)
-    finalize.add_argument("--transcript", action="append", dest="transcripts", help="Explicit transcript path; repeat for agent sessions")
-    args, legacy = parser.parse_known_args()
+    finalize.add_argument("--transcript", action="append", default=[], help="Path to an agent transcript; repeat for each agent")
+    args = parser.parse_args()
+
+    if args.command is None:
+        parser.print_usage(sys.stderr)
+        print(
+            "Missing command. Start with `begin --prompt \"...\"`, then finish with `finalize --run-id <run_id>`.",
+            file=sys.stderr,
+        )
+        return 2
 
     if args.command == "begin":
         state = begin_run(args.run_id, args.prompt)
-        print(json.dumps({"run_id": state["run_id"], "started_at": state["started_at"]}))
+        print(json.dumps({"run_id": state["run_id"], "started_at": state["started_at"]}, ensure_ascii=False))
         return
-    if args.command == "finalize":
-        record = finalize_run(args.run_id, args.output, args.transcripts)
-        print(json.dumps({"run_id": record["run_id"], "status": record["status"], "agents": record["agents"], "tokens": record["tokens"], "highest_cost_step": record["highest_cost_step"], "step_usage": record["step_usage"]}, ensure_ascii=False))
-        return
+    record = finalize_run(args.run_id, args.output, args.transcript)
+    print(json.dumps(record, ensure_ascii=False))
 
-    # Backward compatible one-shot mode: --single-run/--full-session [output.json] [transcript.jsonl]
-    single_run = "--full-session" not in legacy
-    positional = [arg for arg in legacy if not arg.startswith("--")]
-    target_json = next((arg for arg in positional if arg.endswith(".json")), DEFAULT_JSON_PATH)
-    specific_file = next((arg for arg in positional if arg.endswith(".jsonl")), None)
-    files_to_check = [specific_file] if specific_file else find_session_transcripts()
-    if not files_to_check:
-        print("No transcript .jsonl files found in current workspace or standard directories.")
-        return
-    files_to_check.sort(key=lambda path: os.path.getmtime(path), reverse=True)
-    latest_file = files_to_check[0]
-    stats = detect_and_parse_transcript(latest_file, single_run=single_run)
-    if not stats:
-        print(f"Could not parse token metrics from {latest_file}")
-        return
-    now = datetime.now()
-    record = {
-        "date": date.today().strftime("%Y-%m-%d"), "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
-        "scope": stats["scope"], "agent": stats["agent"], "session_id": stats["session_id"],
-        "turn_id": stats.get("turn_id"), "trigger_prompt": stats["prompt"],
-        "tokens": {"input": stats["input_tokens"], "output": stats["output_tokens"], "cache": stats["cache_tokens"], "total": stats["total_tokens"]},
-        "transcript_path": latest_file
-    }
-    update_json_records(target_json, record)
-    print(f"Logged [{stats['scope']}] token usage in [{target_json}]: {stats['total_tokens']:,} tokens ({stats['agent']}).")
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
