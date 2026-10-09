@@ -25,6 +25,10 @@ out/
 .env.*.local
 *.pem
 *.key
+credentials.json
+token.json
+timesheet-logger/credentials.json
+timesheet-logger/token.json
 
 # ==========================================
 # Logs and Databases
