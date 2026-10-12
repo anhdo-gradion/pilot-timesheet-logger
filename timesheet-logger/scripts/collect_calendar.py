@@ -242,7 +242,10 @@ def main():
     parser.add_argument("--timezone-offset", type=float, default=7, help="Timezone UTC offset in hours")
     parser.add_argument("--calendar-id", default="primary")
     parser.add_argument("--max-results", type=int, default=250)
+    parser.add_argument("--auth", action="store_true", help="Open Google browser authentication when needed")
     args = parser.parse_args()
+    if args.auth:
+        ensure_google_auth()
     result = collect_today_events(args.date, args.timezone_offset, args.calendar_id, args.max_results)
     print(json.dumps(result, separators=(',', ':')))
 
