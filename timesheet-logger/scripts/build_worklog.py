@@ -11,6 +11,7 @@ from datetime import date
 
 CLASSIFICATION = "Gradion Intern Academy 2026"
 TASK_TAG = "#SE"
+MAX_TASK_MINUTES = 4 * 60
 WORK_PERIODS = {
     "full": ((9 * 60, 12 * 60), (13 * 60, 18 * 60)),
     "morning": ((9 * 60, 12 * 60),),
@@ -248,6 +249,18 @@ def allocate_prs(tasks, gaps):
         task_blocks = [(start, end) for start, end in task_blocks if end > start]
         if not task_blocks:
             raise ValueError(f"Scheduler could not assign a work block to PR #{task['number']}.")
+        # Bound the total daily time assigned to one PR. Any remainder stays
+        # visibly unallocated instead of stretching a single task too far.
+        capped_blocks = []
+        remaining = MAX_TASK_MINUTES
+        for start, end in task_blocks:
+            duration = min(end - start, remaining)
+            if duration > 0:
+                capped_blocks.append((start, start + duration))
+                remaining -= duration
+            if remaining == 0:
+                break
+        task_blocks = capped_blocks
         for part, (start, end) in enumerate(task_blocks, start=1):
             blocks.append({
                 "start": start,
