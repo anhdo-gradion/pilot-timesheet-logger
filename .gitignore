@@ -30,6 +30,7 @@ token.json
 timesheet-logger/credentials.json
 timesheet-logger/token.json
 .timesheet-token-runs/
+*.jsonl
 
 # ==========================================
 # Logs and Databases
