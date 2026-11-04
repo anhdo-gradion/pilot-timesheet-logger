@@ -12,6 +12,9 @@ from datetime import date
 CLASSIFICATION = "Gradion Intern Academy 2026"
 TASK_TAG = "#SE"
 MAX_TASK_MINUTES = 4 * 60
+
+MIN_TASK_MINUTES = 16
+MIN_BLOCK_MINUTES = 16
 WORK_PERIODS = {
     "full": ((9 * 60, 12 * 60), (13 * 60, 18 * 60)),
     "morning": ((9 * 60, 12 * 60),),
@@ -183,84 +186,136 @@ def open_gaps(occupied, work_windows):
 
 
 def allocate_prs(tasks, gaps):
-    """Assign each free work minute to the closest Git activity timestamp.
+    """Distribute available gap time evenly among PRs.
 
-    Calendar intervals stay fixed. Git timestamps act as sorted anchors; the
-    midpoint between adjacent anchors divides ownership of the remaining
-    workday, so blocks follow actual commit/review timing rather than an
-    arbitrary equal split starting at 09:00.
+    Ensures:
+    - Every PR has total duration > 15 minutes and <= MAX_TASK_MINUTES (4 hours).
+    - Every generated work block in a gap is > 15 minutes.
+    - Google Calendar events and gaps <= 15 minutes remain intact.
+    - Time is split as evenly as possible among tasks.
     """
-    if not tasks:
+    valid_gaps = [g for g in gaps if g[1] - g[0] >= MIN_BLOCK_MINUTES]
+    if not valid_gaps or not tasks:
         return []
 
-    gap_axes = []
-    axis_cursor = 0
-    for start, end in gaps:
-        gap_axes.append((start, end, axis_cursor, axis_cursor + end - start))
-        axis_cursor += end - start
-    total_minutes = axis_cursor
-    if total_minutes < len(tasks):
-        raise ValueError("There are fewer free work minutes than PRs; cannot give every PR a valid work block.")
+    task_count = len(tasks)
 
-    def to_axis(value):
-        """Project an event time onto free time, skipping lunch and Calendar."""
+    def solve(step):
+        gap_ranges = []
         elapsed = 0
-        candidates = []
-        for start, end in gaps:
-            if start <= value <= end:
-                return elapsed + value - start
-            candidates.append((abs(value - start), elapsed))
-            candidates.append((abs(value - end), elapsed + end - start))
-            elapsed += end - start
-        return min(candidates)[1]
+        cuts = [0]
+        for g_idx, (g_start, g_end) in enumerate(valid_gaps):
+            gap_dur = g_end - g_start
+            f_start = elapsed
+            f_end = elapsed + gap_dur
+            gap_ranges.append((f_start, f_end, g_idx, g_start, g_end))
 
-    anchored = sorted(
-        ((to_axis(first_activity(task)), task) for task in tasks),
-        key=lambda pair: (pair[0], pair[1].get("repo", ""), int(pair[1]["number"])),
-    )
+            if f_start not in cuts:
+                cuts.append(f_start)
+            if f_end not in cuts:
+                cuts.append(f_end)
 
-    # A one-minute minimum keeps every unique PR represented, including when
-    # multiple Git events share the same minute. Clamp the anchors to leave
-    # enough room for the remaining PRs.
-    positions = []
-    for index, (position, _task) in enumerate(anchored):
-        low = positions[-1] + 1 if positions else 0
-        high = total_minutes - (len(anchored) - index)
-        position = max(low, min(position, high))
-        positions.append(position)
+            for m in range(g_start + MIN_BLOCK_MINUTES, g_end - MIN_BLOCK_MINUTES + 1):
+                if m % step == 0:
+                    f = f_start + (m - g_start)
+                    if f not in cuts:
+                        cuts.append(f)
+            elapsed = f_end
 
-    boundaries = [0]
-    boundaries.extend((left + right) // 2 for left, right in zip(positions, positions[1:]))
-    boundaries.append(total_minutes)
+        cuts = sorted(set(cuts))
+        total_flat = elapsed
+
+        if total_flat < task_count * MIN_TASK_MINUTES:
+            raise ValueError(
+                f"There are fewer free work minutes ({total_flat}m) than needed for {task_count} PRs (> 15m each)."
+            )
+
+        if task_count == 1:
+            dur = min(total_flat, MAX_TASK_MINUTES)
+            valid_cuts = []
+            for c in cuts:
+                if c < MIN_BLOCK_MINUTES or c > dur:
+                    continue
+                valid = True
+                for f_s, f_e, _, _, _ in gap_ranges:
+                    ov = min(c, f_e) - max(0, f_s)
+                    if 0 < ov < MIN_BLOCK_MINUTES:
+                        valid = False
+                        break
+                if valid:
+                    valid_cuts.append(c)
+            best_c = max(valid_cuts) if valid_cuts else MIN_BLOCK_MINUTES
+            return [(0, best_c)], gap_ranges
+
+        target_dur = min(total_flat / task_count, MAX_TASK_MINUTES)
+        dp = {0: {0: (0, -1)}}
+
+        for t in range(task_count):
+            dp[t + 1] = {}
+            for prev_c, (prev_cost, _) in dp[t].items():
+                for c in cuts:
+                    if c <= prev_c:
+                        continue
+                    dur = c - prev_c
+                    if dur < MIN_TASK_MINUTES or dur > MAX_TASK_MINUTES:
+                        continue
+                    if t == task_count - 1:
+                        if total_flat - prev_c <= MAX_TASK_MINUTES:
+                            if c != total_flat:
+                                continue
+
+                    valid = True
+                    for f_s, f_e, _, _, _ in gap_ranges:
+                        ov = min(c, f_e) - max(prev_c, f_s)
+                        if 0 < ov < MIN_BLOCK_MINUTES:
+                            valid = False
+                            break
+                    if not valid:
+                        continue
+
+                    cost = prev_cost + (dur - target_dur) ** 2
+                    if c not in dp[t + 1] or cost < dp[t + 1][c][0]:
+                        dp[t + 1][c] = (cost, prev_c)
+
+        final_states = dp[task_count]
+        if not final_states:
+            return None, gap_ranges
+
+        best_c = min(final_states.keys(), key=lambda c: final_states[c][0])
+        result_cuts = [best_c]
+        curr = best_c
+        for t in range(task_count, 0, -1):
+            prev = dp[t][curr][1]
+            result_cuts.append(prev)
+            curr = prev
+        result_cuts.reverse()
+        return list(zip(result_cuts[:-1], result_cuts[1:])), gap_ranges
+
+    has_odd_gaps = any(g[0] % 5 != 0 or g[1] % 5 != 0 for g in valid_gaps)
+    intervals = None
+    gap_ranges = []
+    if not has_odd_gaps:
+        intervals, gap_ranges = solve(step=5)
+    if intervals is None:
+        intervals, gap_ranges = solve(step=1)
+    if intervals is None:
+        raise ValueError("Scheduler could not find a valid even distribution satisfying all constraints.")
 
     blocks = []
-    for index, (_position, task) in enumerate(anchored):
-        owned_start, owned_end = boundaries[index], boundaries[index + 1]
+    for t_idx, (c_start, c_end) in enumerate(intervals):
+        task = tasks[t_idx]
         task_blocks = []
-        for gap_start, gap_end, gap_axis_start, gap_axis_end in gap_axes:
-            segment_start = max(owned_start, gap_axis_start)
-            segment_end = min(owned_end, gap_axis_end)
-            if segment_start >= segment_end:
-                continue
-            wall_start = gap_start + segment_start - gap_axis_start
-            wall_end = gap_start + segment_end - gap_axis_start
-            task_blocks.append((wall_start, wall_end))
+        for f_start, f_end, g_idx, g_start, g_end in gap_ranges:
+            ov_s = max(c_start, f_start)
+            ov_e = min(c_end, f_end)
+            if ov_e > ov_s:
+                w_s = g_start + (ov_s - f_start)
+                w_e = g_start + (ov_e - f_start)
+                task_blocks.append((w_s, w_e))
 
-        task_blocks = [(start, end) for start, end in task_blocks if end > start]
         if not task_blocks:
             raise ValueError(f"Scheduler could not assign a work block to PR #{task['number']}.")
-        # Bound the total daily time assigned to one PR. Any remainder stays
-        # visibly unallocated instead of stretching a single task too far.
-        capped_blocks = []
-        remaining = MAX_TASK_MINUTES
-        for start, end in task_blocks:
-            duration = min(end - start, remaining)
-            if duration > 0:
-                capped_blocks.append((start, start + duration))
-                remaining -= duration
-            if remaining == 0:
-                break
-        task_blocks = capped_blocks
+
         for part, (start, end) in enumerate(task_blocks, start=1):
             blocks.append({
                 "start": start,
